@@ -76,7 +76,8 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
 
-    for (int p = 0; p < k; p += 4) {
+    int p = 0;
+    for (; p <= k - 4; p += 4) {
         // Load B rows (contiguous)
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
@@ -98,6 +99,19 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
             c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
         }
         a_ptr += 64;
+    }
+    
+    // Cleanup loop
+    for (; p < k; ++p) {
+        __m512 b = _mm512_load_ps(b_ptr);
+        b_ptr += 16;
+        
+        #pragma GCC unroll 16
+        for (int i = 0; i < 16; ++i) {
+            __m512 a = _mm512_set1_ps(a_ptr[i]);
+            c[i] = _mm512_fmadd_ps(a, b, c[i]);
+        }
+        a_ptr += 16;
     }
 
     // Store C rows (contiguous)
@@ -140,25 +154,46 @@ void kernel_16x1(int k, const float* packedA, const float* packedB, float* C, in
 void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
     int mr = 16;
-    for (int p = p0; p < p_max; ++p) {
-        for (int i = 0; i < mr; ++i) {
-            if (i0 + i < i_max) {
-                *packed++ = A[(i0 + i) * lda + p];
-            } else {
-                *packed++ = 0.0f;
-            }
+    
+    // Prepare gather indices
+    int indices[16];
+    for(int i=0; i<16; ++i) indices[i] = i * lda;
+    __m512i vindex = _mm512_loadu_si512(indices);
+
+    if (i0 + 16 <= i_max) {
+        // Fast path: unmasked gather
+        for (int p = p0; p < p_max; ++p) {
+            __m512 a = _mm512_i32gather_ps(vindex, &A[i0 * lda + p], 4);
+            _mm512_store_ps(packed, a);
+            packed += 16;
+        }
+    } else {
+        // Slow path: masked gather
+        __mmask16 mask = (1 << (i_max - i0)) - 1;
+        for (int p = p0; p < p_max; ++p) {
+            __m512 a = _mm512_mask_i32gather_ps(_mm512_setzero_ps(), mask, vindex, &A[i0 * lda + p], 4);
+            _mm512_store_ps(packed, a);
+            packed += 16;
         }
     }
 }
 
 void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max, int nr, float* packed) {
     (void)k;
-    for (int p = p0; p < p_max; ++p) {
-        for (int j = 0; j < nr; ++j) {
-            if (j0 + j < j_max) {
-                *packed++ = B[p * ldb + (j0 + j)];
-            } else {
-                *packed++ = 0.0f;
+    if (nr == 16 && j0 + 16 <= j_max) {
+        for (int p = p0; p < p_max; ++p) {
+            __m512 b = _mm512_loadu_ps(&B[p * ldb + j0]);
+            _mm512_store_ps(packed, b);
+            packed += 16;
+        }
+    } else {
+        for (int p = p0; p < p_max; ++p) {
+            for (int j = 0; j < nr; ++j) {
+                if (j0 + j < j_max) {
+                    *packed++ = B[p * ldb + (j0 + j)];
+                } else {
+                    *packed++ = 0.0f;
+                }
             }
         }
     }
