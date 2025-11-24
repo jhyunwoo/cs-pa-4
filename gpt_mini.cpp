@@ -68,35 +68,31 @@ float* transpose(const float* M, int rows, int cols) {
 void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, int ldc) {
     __m512 c[16];
     
-    // Prepare indices for gather/scatter: 0, ldc, 2*ldc, ..., 15*ldc
-    int indices[16];
-    for(int i=0; i<16; ++i) indices[i] = i * ldc;
-    __m512i vindex = _mm512_loadu_si512(indices);
-
-    // Load C using gather
-    for (int j = 0; j < 16; ++j) {
-        c[j] = _mm512_i32gather_ps(vindex, &C[j], 4);
+    // Load C rows (contiguous)
+    for (int i = 0; i < 16; ++i) {
+        c[i] = _mm512_loadu_ps(C + i * ldc);
     }
 
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
 
     for (int p = 0; p < k; ++p) {
-        __m512 a = _mm512_load_ps(a_ptr);
-        a_ptr += 16;
+        // Load B row (contiguous)
+        __m512 b = _mm512_load_ps(b_ptr);
+        b_ptr += 16;
 
         #pragma GCC unroll 16
-        for (int j = 0; j < 16; ++j) {
-            // Broadcast B[p, j]
-            __m512 b = _mm512_set1_ps(b_ptr[j]);
-            c[j] = _mm512_fmadd_ps(a, b, c[j]);
+        for (int i = 0; i < 16; ++i) {
+            // Broadcast A[i, p]
+            __m512 a = _mm512_set1_ps(a_ptr[i]);
+            c[i] = _mm512_fmadd_ps(a, b, c[i]);
         }
-        b_ptr += 16;
+        a_ptr += 16;
     }
 
-    // Store C using scatter
-    for (int j = 0; j < 16; ++j) {
-        _mm512_i32scatter_ps(&C[j], vindex, c[j], 4);
+    // Store C rows (contiguous)
+    for (int i = 0; i < 16; ++i) {
+        _mm512_storeu_ps(C + i * ldc, c[i]);
     }
 }
 
@@ -559,4 +555,3 @@ int GPTMini::generate_next(const vector<int>& context) { return impl->generate_n
 void GPTMini::enable_layer_dumping(const std::string& directory) {
     impl->enable_layer_dumping(directory);
 }
-
