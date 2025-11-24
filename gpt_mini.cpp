@@ -69,9 +69,7 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
     __m512 c[16];
     
     // Load C rows (contiguous)
-    for (int i = 0; i < 16; ++i) {
-        c[i] = _mm512_loadu_ps(C + i * ldc);
-    }
+    for (int i = 0; i < 16; ++i) c[i] = _mm512_loadu_ps(C + i * ldc);
 
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
@@ -88,7 +86,7 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
         b_ptr += 128;
-
+        
         #pragma GCC unroll 16
         for (int i = 0; i < 16; ++i) {
             // Broadcast A[i, p...p+7]
@@ -127,40 +125,70 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
     }
 
     // Store C rows (contiguous)
-    for (int i = 0; i < 16; ++i) {
-        _mm512_storeu_ps(C + i * ldc, c[i]);
-    }
+    for (int i = 0; i < 16; ++i) _mm512_storeu_ps(C + i * ldc, c[i]);
 }
 
-void kernel_16x1(int k, const float* packedA, const float* packedB, float* C, int ldc) {
-    if (ldc == 1) {
-        __m512 c0 = _mm512_loadu_ps(C);
-        for (int p = 0; p < k; ++p) {
-            __m512 a0 = _mm512_load_ps(&packedA[p * 16]);
-            __m512 b = _mm512_set1_ps(packedB[p]);
-            c0 = _mm512_fmadd_ps(a0, b, c0);
+void kernel_16x16_masked(int k, const float* packedA, const float* packedB, float* C, int ldc, __mmask16 mask) {
+    __m512 c[16];
+    
+    // Load C rows (contiguous)
+    for (int i = 0; i < 16; ++i) c[i] = _mm512_maskz_loadu_ps(mask, C + i * ldc);
+
+    const float* b_ptr = packedB;
+    const float* a_ptr = packedA;
+
+    int p = 0;
+    for (; p <= k - 8; p += 8) {
+        // Load B rows (contiguous)
+        __m512 b0 = _mm512_load_ps(b_ptr);
+        __m512 b1 = _mm512_load_ps(b_ptr + 16);
+        __m512 b2 = _mm512_load_ps(b_ptr + 32);
+        __m512 b3 = _mm512_load_ps(b_ptr + 48);
+        __m512 b4 = _mm512_load_ps(b_ptr + 64);
+        __m512 b5 = _mm512_load_ps(b_ptr + 80);
+        __m512 b6 = _mm512_load_ps(b_ptr + 96);
+        __m512 b7 = _mm512_load_ps(b_ptr + 112);
+        b_ptr += 128;
+        
+        #pragma GCC unroll 16
+        for (int i = 0; i < 16; ++i) {
+            // Broadcast A[i, p...p+7]
+            __m512 a0 = _mm512_set1_ps(a_ptr[i]);
+            __m512 a1 = _mm512_set1_ps(a_ptr[i + 16]);
+            __m512 a2 = _mm512_set1_ps(a_ptr[i + 32]);
+            __m512 a3 = _mm512_set1_ps(a_ptr[i + 48]);
+            __m512 a4 = _mm512_set1_ps(a_ptr[i + 64]);
+            __m512 a5 = _mm512_set1_ps(a_ptr[i + 80]);
+            __m512 a6 = _mm512_set1_ps(a_ptr[i + 96]);
+            __m512 a7 = _mm512_set1_ps(a_ptr[i + 112]);
+            
+            c[i] = _mm512_fmadd_ps(a0, b0, c[i]);
+            c[i] = _mm512_fmadd_ps(a1, b1, c[i]);
+            c[i] = _mm512_fmadd_ps(a2, b2, c[i]);
+            c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
+            c[i] = _mm512_fmadd_ps(a4, b4, c[i]);
+            c[i] = _mm512_fmadd_ps(a5, b5, c[i]);
+            c[i] = _mm512_fmadd_ps(a6, b6, c[i]);
+            c[i] = _mm512_fmadd_ps(a7, b7, c[i]);
         }
-        _mm512_storeu_ps(C, c0);
-        return;
+        a_ptr += 128;
+    }
+    
+    // Cleanup loop
+    for (; p < k; ++p) {
+        __m512 b = _mm512_load_ps(b_ptr);
+        b_ptr += 16;
+        
+        #pragma GCC unroll 16
+        for (int i = 0; i < 16; ++i) {
+            __m512 a = _mm512_set1_ps(a_ptr[i]);
+            c[i] = _mm512_fmadd_ps(a, b, c[i]);
+        }
+        a_ptr += 16;
     }
 
-    // Prepare indices for gather/scatter
-    int indices[16];
-    for(int i=0; i<16; ++i) indices[i] = i * ldc;
-    __m512i vindex = _mm512_loadu_si512(indices);
-
-    // Load C (16 rows, 1 col)
-    // C[0,0], C[1,0]... stride ldc
-    // We can use the same gather with &C[0]
-    __m512 c0 = _mm512_i32gather_ps(vindex, C, 4);
-
-    for (int p = 0; p < k; ++p) {
-        __m512 a0 = _mm512_load_ps(&packedA[p * 16]);
-        __m512 b = _mm512_set1_ps(packedB[p]);
-        c0 = _mm512_fmadd_ps(a0, b, c0);
-    }
-
-    _mm512_i32scatter_ps(C, vindex, c0, 4);
+    // Store C rows (contiguous)
+    for (int i = 0; i < 16; ++i) _mm512_mask_storeu_ps(C + i * ldc, mask, c[i]);
 }
 
 void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
@@ -248,11 +276,13 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
                     }
                 }
                 
-                for (; j < j_lim; ++j) {
-                    pack_B(k, B, n, p0, p_lim, j, j + 1, 1, packedB);
+                if (j < j_lim) {
+                    int remain = j_lim - j;
+                    pack_B(k, B, n, p0, p_lim, j, j + remain, 16, packedB); // Pad to 16
+                    __mmask16 mask = (1 << remain) - 1;
                     
                     for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x1(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
+                        kernel_16x16_masked(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n, mask);
                     }
                 }
             }
@@ -300,11 +330,13 @@ float* matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, cons
                     }
                 }
                 
-                for (; j < j_lim; ++j) {
-                    pack_B(k, B, n, p0, p_lim, j, j + 1, 1, packedB);
+                if (j < j_lim) {
+                    int remain = j_lim - j;
+                    pack_B(k, B, n, p0, p_lim, j, j + remain, 16, packedB); // Pad to 16
+                    __mmask16 mask = (1 << remain) - 1;
                     
                     for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x1(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
+                        kernel_16x16_masked(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n, mask);
                     }
                 }
             }
