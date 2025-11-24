@@ -77,28 +77,40 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
     const float* a_ptr = packedA;
 
     int p = 0;
-    for (; p <= k - 4; p += 4) {
+    for (; p <= k - 8; p += 8) {
         // Load B rows (contiguous)
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
         __m512 b3 = _mm512_load_ps(b_ptr + 48);
-        b_ptr += 64;
+        __m512 b4 = _mm512_load_ps(b_ptr + 64);
+        __m512 b5 = _mm512_load_ps(b_ptr + 80);
+        __m512 b6 = _mm512_load_ps(b_ptr + 96);
+        __m512 b7 = _mm512_load_ps(b_ptr + 112);
+        b_ptr += 128;
 
         #pragma GCC unroll 16
         for (int i = 0; i < 16; ++i) {
-            // Broadcast A[i, p...p+3]
+            // Broadcast A[i, p...p+7]
             __m512 a0 = _mm512_set1_ps(a_ptr[i]);
             __m512 a1 = _mm512_set1_ps(a_ptr[i + 16]);
             __m512 a2 = _mm512_set1_ps(a_ptr[i + 32]);
             __m512 a3 = _mm512_set1_ps(a_ptr[i + 48]);
+            __m512 a4 = _mm512_set1_ps(a_ptr[i + 64]);
+            __m512 a5 = _mm512_set1_ps(a_ptr[i + 80]);
+            __m512 a6 = _mm512_set1_ps(a_ptr[i + 96]);
+            __m512 a7 = _mm512_set1_ps(a_ptr[i + 112]);
             
             c[i] = _mm512_fmadd_ps(a0, b0, c[i]);
             c[i] = _mm512_fmadd_ps(a1, b1, c[i]);
             c[i] = _mm512_fmadd_ps(a2, b2, c[i]);
             c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
+            c[i] = _mm512_fmadd_ps(a4, b4, c[i]);
+            c[i] = _mm512_fmadd_ps(a5, b5, c[i]);
+            c[i] = _mm512_fmadd_ps(a6, b6, c[i]);
+            c[i] = _mm512_fmadd_ps(a7, b7, c[i]);
         }
-        a_ptr += 64;
+        a_ptr += 128;
     }
     
     // Cleanup loop
