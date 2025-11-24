@@ -65,71 +65,70 @@ float* transpose(const float* M, int rows, int cols) {
 
 // === Need to Optimize === //
 
-void kernel_16x6(int k, const float* packedA, const float* packedB, float* C, int ldc) {
-    __m256 c[12];
-    // Load C
-    for (int j = 0; j < 6; ++j) {
-        c[j * 2 + 0] = _mm256_loadu_ps(&C[0 * ldc + j]);
-        c[j * 2 + 0] = _mm256_set_ps(
-            C[7 * ldc + j], C[6 * ldc + j], C[5 * ldc + j], C[4 * ldc + j],
-            C[3 * ldc + j], C[2 * ldc + j], C[1 * ldc + j], C[0 * ldc + j]
-        );
-        c[j * 2 + 1] = _mm256_set_ps(
-            C[15 * ldc + j], C[14 * ldc + j], C[13 * ldc + j], C[12 * ldc + j],
-            C[11 * ldc + j], C[10 * ldc + j], C[9 * ldc + j], C[8 * ldc + j]
-        );
+void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, int ldc) {
+    __m512 c[16];
+    
+    // Prepare indices for gather/scatter: 0, ldc, 2*ldc, ..., 15*ldc
+    int indices[16];
+    for(int i=0; i<16; ++i) indices[i] = i * ldc;
+    __m512i vindex = _mm512_loadu_si512(indices);
+
+    // Load C using gather
+    for (int j = 0; j < 16; ++j) {
+        c[j] = _mm512_i32gather_ps(vindex, &C[j], 4);
     }
 
-    int p = 0;
-    for (; p < k; ++p) {
-        __m256 a0 = _mm256_load_ps(&packedA[p * 16 + 0]);
-        __m256 a1 = _mm256_load_ps(&packedA[p * 16 + 8]);
+    const float* b_ptr = packedB;
+    const float* a_ptr = packedA;
 
-        const float* b_ptr = &packedB[p * 6];
-        
-        #pragma GCC unroll 6
-        for (int j = 0; j < 6; ++j) {
-            __m256 b = _mm256_broadcast_ss(&b_ptr[j]);
-            c[j * 2 + 0] = _mm256_fmadd_ps(a0, b, c[j * 2 + 0]);
-            c[j * 2 + 1] = _mm256_fmadd_ps(a1, b, c[j * 2 + 1]);
+    for (int p = 0; p < k; ++p) {
+        __m512 a = _mm512_load_ps(a_ptr);
+        a_ptr += 16;
+
+        #pragma GCC unroll 16
+        for (int j = 0; j < 16; ++j) {
+            // Broadcast B[p, j]
+            __m512 b = _mm512_set1_ps(b_ptr[j]);
+            c[j] = _mm512_fmadd_ps(a, b, c[j]);
         }
+        b_ptr += 16;
     }
 
-    for (int j = 0; j < 6; ++j) {
-        float tmp[16];
-        _mm256_storeu_ps(tmp, c[j * 2 + 0]);
-        _mm256_storeu_ps(tmp + 8, c[j * 2 + 1]);
-        
-        for (int i = 0; i < 16; ++i) {
-            C[i * ldc + j] = tmp[i];
-        }
+    // Store C using scatter
+    for (int j = 0; j < 16; ++j) {
+        _mm512_i32scatter_ps(&C[j], vindex, c[j], 4);
     }
 }
 
 void kernel_16x1(int k, const float* packedA, const float* packedB, float* C, int ldc) {
-    __m256 c0 = _mm256_set_ps(
-        C[7 * ldc], C[6 * ldc], C[5 * ldc], C[4 * ldc],
-        C[3 * ldc], C[2 * ldc], C[1 * ldc], C[0 * ldc]
-    );
-    __m256 c1 = _mm256_set_ps(
-        C[15 * ldc], C[14 * ldc], C[13 * ldc], C[12 * ldc],
-        C[11 * ldc], C[10 * ldc], C[9 * ldc], C[8 * ldc]
-    );
+    if (ldc == 1) {
+        __m512 c0 = _mm512_loadu_ps(C);
+        for (int p = 0; p < k; ++p) {
+            __m512 a0 = _mm512_load_ps(&packedA[p * 16]);
+            __m512 b = _mm512_set1_ps(packedB[p]);
+            c0 = _mm512_fmadd_ps(a0, b, c0);
+        }
+        _mm512_storeu_ps(C, c0);
+        return;
+    }
+
+    // Prepare indices for gather/scatter
+    int indices[16];
+    for(int i=0; i<16; ++i) indices[i] = i * ldc;
+    __m512i vindex = _mm512_loadu_si512(indices);
+
+    // Load C (16 rows, 1 col)
+    // C[0,0], C[1,0]... stride ldc
+    // We can use the same gather with &C[0]
+    __m512 c0 = _mm512_i32gather_ps(vindex, C, 4);
 
     for (int p = 0; p < k; ++p) {
-        __m256 a0 = _mm256_load_ps(&packedA[p * 16 + 0]);
-        __m256 a1 = _mm256_load_ps(&packedA[p * 16 + 8]);
-        __m256 b = _mm256_broadcast_ss(&packedB[p]);
-        c0 = _mm256_fmadd_ps(a0, b, c0);
-        c1 = _mm256_fmadd_ps(a1, b, c1);
+        __m512 a0 = _mm512_load_ps(&packedA[p * 16]);
+        __m512 b = _mm512_set1_ps(packedB[p]);
+        c0 = _mm512_fmadd_ps(a0, b, c0);
     }
 
-    float tmp[16];
-    _mm256_storeu_ps(tmp, c0);
-    _mm256_storeu_ps(tmp + 8, c1);
-    for (int i = 0; i < 16; ++i) {
-        C[i * ldc] = tmp[i];
-    }
+    _mm512_i32scatter_ps(C, vindex, c0, 4);
 }
 
 void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
@@ -161,7 +160,7 @@ void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max
 
 float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int n) {
     const int MR = 16;
-    const int NR = 6;
+    const int NR = 16;
     
     int m_padded = (m + MR - 1) & ~(MR - 1);
     float* C = new float[m_padded * n];
@@ -192,7 +191,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
                     pack_B(k, B, n, p0, p_lim, j, j + NR, NR, packedB);
                     
                     for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x6(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
+                        kernel_16x16(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
                     }
                 }
                 
@@ -212,7 +211,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
 
 float* matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n) {
     const int MR = 16;
-    const int NR = 6;
+    const int NR = 16;
     
     int m_padded = (m + MR - 1) & ~(MR - 1);
     float* C = new float[m_padded * n];
@@ -244,7 +243,7 @@ float* matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, cons
                     pack_B(k, B, n, p0, p_lim, j, j + NR, NR, packedB);
                     
                     for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x6(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
+                        kernel_16x16(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
                     }
                 }
                 
@@ -481,7 +480,7 @@ struct GPTMini::Impl {
     int d_ff;
     int n_layer;
     vector<unique_ptr<TransformerBlock>> blocks;
-    Linear embed;
+    float* embed_W;
     Linear lm_head;
     bool dump_enabled = false;
     std::string dump_dir;
@@ -494,7 +493,7 @@ struct GPTMini::Impl {
           d_ff(d_ff),
           n_layer(n_layer),
           blocks(),
-          embed(vocab, d_model, embed_weights),
+          embed_W(embed_weights), // Changed initialization
           lm_head(d_model, vocab, lm_head_weights) {
         blocks.reserve(n_layer);
         for (int i = 0; i < n_layer; i++) {
@@ -503,6 +502,10 @@ struct GPTMini::Impl {
                                                                    bw.Wk, bw.Wv, bw.Wo, bw.fc1,
                                                                    bw.fc2));
         }
+    }
+
+    ~Impl() {
+        delete[] embed_W;
     }
 
     void enable_layer_dumping(const std::string& directory) {
@@ -518,7 +521,7 @@ struct GPTMini::Impl {
         float* x = new float[T * d_model];
         for (int t = 0; t < T; t++) {
             int id = tokens[t];
-            for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed.W[id * d_model + i];
+            for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed_W[id * d_model + i];
         }
         return x;
     }
