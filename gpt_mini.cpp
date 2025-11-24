@@ -76,18 +76,28 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
 
-    for (int p = 0; p < k; ++p) {
-        // Load B row (contiguous)
-        __m512 b = _mm512_load_ps(b_ptr);
-        b_ptr += 16;
+    for (int p = 0; p < k; p += 4) {
+        // Load B rows (contiguous)
+        __m512 b0 = _mm512_load_ps(b_ptr);
+        __m512 b1 = _mm512_load_ps(b_ptr + 16);
+        __m512 b2 = _mm512_load_ps(b_ptr + 32);
+        __m512 b3 = _mm512_load_ps(b_ptr + 48);
+        b_ptr += 64;
 
         #pragma GCC unroll 16
         for (int i = 0; i < 16; ++i) {
-            // Broadcast A[i, p]
-            __m512 a = _mm512_set1_ps(a_ptr[i]);
-            c[i] = _mm512_fmadd_ps(a, b, c[i]);
+            // Broadcast A[i, p...p+3]
+            __m512 a0 = _mm512_set1_ps(a_ptr[i]);
+            __m512 a1 = _mm512_set1_ps(a_ptr[i + 16]);
+            __m512 a2 = _mm512_set1_ps(a_ptr[i + 32]);
+            __m512 a3 = _mm512_set1_ps(a_ptr[i + 48]);
+            
+            c[i] = _mm512_fmadd_ps(a0, b0, c[i]);
+            c[i] = _mm512_fmadd_ps(a1, b1, c[i]);
+            c[i] = _mm512_fmadd_ps(a2, b2, c[i]);
+            c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
         }
-        a_ptr += 16;
+        a_ptr += 64;
     }
 
     // Store C rows (contiguous)
