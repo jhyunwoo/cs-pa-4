@@ -296,6 +296,22 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     return C;
 }
 
+void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
+    __m512 c = _mm512_loadu_ps(C);
+    
+    const float* a_ptr = packedA;
+    const float* b_ptr = B;
+
+    for (int p = 0; p < k; ++p) {
+        __m512 b = _mm512_set1_ps(*b_ptr++);
+        __m512 a = _mm512_load_ps(a_ptr);
+        a_ptr += 16;
+        c = _mm512_fmadd_ps(a, b, c);
+    }
+    
+    _mm512_storeu_ps(C, c);
+}
+
 void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n, float* C) {
     const int MR = 16;
     const int NR = 16;
@@ -307,6 +323,44 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
     const int MC = 256;
     const int KC = 256;
     const int NC = 144;
+
+    if (n == 1) {
+        // Optimized path for GEMV (n=1)
+        for (int p0 = 0; p0 < k; p0 += KC) {
+            int p_lim = std::min(k, p0 + KC);
+            
+            for (int i0 = 0; i0 < m_padded; i0 += MC) {
+                int i_lim = std::min(m_padded, i0 + MC);
+                
+                const float* current_a_block = packedA + ((size_t)i0 / MC * (k / KC) + p0 / KC) * (MC * KC); 
+                // Wait, packedA layout is flat?
+                // pack_matrix_A packs in blocks: p0 loop, then i0 loop.
+                // Let's check pack_matrix_A layout.
+                // It iterates p0, then i0.
+                // So blocks are ordered by (p0, i0).
+                // Block size: (i_lim - i0) * (p_lim - p0).
+                // We need to track pointer carefully.
+            }
+        }
+        
+        // Re-implementing loop to match pack_matrix_A order
+        const float* a_ptr = packedA;
+        for (int p0 = 0; p0 < k; p0 += KC) {
+            int p_lim = std::min(k, p0 + KC);
+            for (int i0 = 0; i0 < m_padded; i0 += MC) {
+                int i_lim = std::min(m_padded, i0 + MC);
+                
+                const float* current_a_block = a_ptr;
+                size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
+                a_ptr += block_size;
+
+                for (int i = i0; i < i_lim; i += MR) {
+                    kernel_16x1(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], &B[p0], &C[i]);
+                }
+            }
+        }
+        return;
+    }
 
     static float* packedB = (float*)alloc_aligned(KC * NC * sizeof(float));
 
@@ -346,7 +400,6 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
             }
         }
     }
-    
 }
 
 float* pack_matrix_A(int m, int k, const float* A) {
