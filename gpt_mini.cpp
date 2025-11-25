@@ -197,7 +197,7 @@ void kernel_16x16_masked(int k, const float* packedA, const float* packedB, floa
 
 void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
-    int mr = 16;
+
     
     // Prepare gather indices
     int indices[16];
@@ -412,22 +412,7 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
 
     if (n == 1) {
         // Optimized path for GEMV (n=1)
-        for (int p0 = 0; p0 < k; p0 += KC) {
-            int p_lim = std::min(k, p0 + KC);
-            
-            for (int i0 = 0; i0 < m_padded; i0 += MC) {
-                int i_lim = std::min(m_padded, i0 + MC);
-                
-                const float* current_a_block = packedA + ((size_t)i0 / MC * (k / KC) + p0 / KC) * (MC * KC); 
-                // Wait, packedA layout is flat?
-                // pack_matrix_A packs in blocks: p0 loop, then i0 loop.
-                // Let's check pack_matrix_A layout.
-                // It iterates p0, then i0.
-                // So blocks are ordered by (p0, i0).
-                // Block size: (i_lim - i0) * (p_lim - p0).
-                // We need to track pointer carefully.
-            }
-        }
+
         
         // Re-implementing loop to match pack_matrix_A order
         const float* a_ptr = packedA;
