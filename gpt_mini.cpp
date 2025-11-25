@@ -243,7 +243,66 @@ void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max
     }
 }
 
+float dot_product(const float* A, const float* B, int k) {
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+    
+    int p = 0;
+    for (; p <= k - 64; p += 64) {
+        sum0 = _mm512_fmadd_ps(_mm512_loadu_ps(A + p), _mm512_loadu_ps(B + p), sum0);
+        sum1 = _mm512_fmadd_ps(_mm512_loadu_ps(A + p + 16), _mm512_loadu_ps(B + p + 16), sum1);
+        sum2 = _mm512_fmadd_ps(_mm512_loadu_ps(A + p + 32), _mm512_loadu_ps(B + p + 32), sum2);
+        sum3 = _mm512_fmadd_ps(_mm512_loadu_ps(A + p + 48), _mm512_loadu_ps(B + p + 48), sum3);
+    }
+    
+    __m512 sum = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
+    
+    // Handle remaining 16-blocks
+    for (; p <= k - 16; p += 16) {
+        sum = _mm512_fmadd_ps(_mm512_loadu_ps(A + p), _mm512_loadu_ps(B + p), sum);
+    }
+    
+    float res = _mm512_reduce_add_ps(sum);
+    for (; p < k; ++p) {
+        res += A[p] * B[p];
+    }
+    return res;
+}
+
+void scale_vector(const float* src, float scale, int n, float* dst) {
+    __m512 s = _mm512_set1_ps(scale);
+    int j = 0;
+    for (; j <= n - 64; j += 64) {
+        _mm512_storeu_ps(dst + j, _mm512_mul_ps(_mm512_loadu_ps(src + j), s));
+        _mm512_storeu_ps(dst + j + 16, _mm512_mul_ps(_mm512_loadu_ps(src + j + 16), s));
+        _mm512_storeu_ps(dst + j + 32, _mm512_mul_ps(_mm512_loadu_ps(src + j + 32), s));
+        _mm512_storeu_ps(dst + j + 48, _mm512_mul_ps(_mm512_loadu_ps(src + j + 48), s));
+    }
+    for (; j <= n - 16; j += 16) {
+        _mm512_storeu_ps(dst + j, _mm512_mul_ps(_mm512_loadu_ps(src + j), s));
+    }
+    for (; j < n; ++j) {
+        dst[j] = src[j] * scale;
+    }
+}
+
 float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int n) {
+    // Fast path for dot product (m=1, n=1)
+    if (m == 1 && n == 1) {
+        float* C = new float[1];
+        C[0] = dot_product(A, B, k);
+        return C;
+    }
+
+    // Fast path for scaling (m=1, k=1) -> C = A[0] * B
+    if (m == 1 && k == 1) {
+        float* C = new float[n];
+        scale_vector(B, A[0], n, C);
+        return C;
+    }
+
     const int MR = 16;
     const int NR = 16;
     
@@ -297,12 +356,39 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
 }
 
 void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
-    __m512 c = _mm512_loadu_ps(C);
+    __m512 c0 = _mm512_loadu_ps(C);
+    __m512 c1 = _mm512_setzero_ps();
+    __m512 c2 = _mm512_setzero_ps();
+    __m512 c3 = _mm512_setzero_ps();
     
     const float* a_ptr = packedA;
     const float* b_ptr = B;
 
-    for (int p = 0; p < k; ++p) {
+    int p = 0;
+    for (; p <= k - 4; p += 4) {
+        __m512 b0 = _mm512_set1_ps(b_ptr[0]);
+        __m512 a0 = _mm512_load_ps(a_ptr);
+        c0 = _mm512_fmadd_ps(a0, b0, c0);
+
+        __m512 b1 = _mm512_set1_ps(b_ptr[1]);
+        __m512 a1 = _mm512_load_ps(a_ptr + 16);
+        c1 = _mm512_fmadd_ps(a1, b1, c1);
+
+        __m512 b2 = _mm512_set1_ps(b_ptr[2]);
+        __m512 a2 = _mm512_load_ps(a_ptr + 32);
+        c2 = _mm512_fmadd_ps(a2, b2, c2);
+
+        __m512 b3 = _mm512_set1_ps(b_ptr[3]);
+        __m512 a3 = _mm512_load_ps(a_ptr + 48);
+        c3 = _mm512_fmadd_ps(a3, b3, c3);
+
+        a_ptr += 64;
+        b_ptr += 4;
+    }
+    
+    __m512 c = _mm512_add_ps(_mm512_add_ps(c0, c1), _mm512_add_ps(c2, c3));
+
+    for (; p < k; ++p) {
         __m512 b = _mm512_set1_ps(*b_ptr++);
         __m512 a = _mm512_load_ps(a_ptr);
         a_ptr += 16;
