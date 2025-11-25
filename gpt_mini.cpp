@@ -54,9 +54,16 @@ float* softmax(const float* x, int size) {
 }
 
 void transpose(const float* M, int rows, int cols, float* T) {
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            T[j * rows + i] = M[i * cols + j];
+    const int BLOCK = 32;
+    for (int i = 0; i < rows; i += BLOCK) {
+        for (int j = 0; j < cols; j += BLOCK) {
+            int i_lim = std::min(rows, i + BLOCK);
+            int j_lim = std::min(cols, j + BLOCK);
+            for (int ii = i; ii < i_lim; ++ii) {
+                for (int jj = j; jj < j_lim; ++jj) {
+                    T[jj * rows + ii] = M[ii * cols + jj];
+                }
+            }
         }
     }
 }
@@ -312,7 +319,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
 
     const int MC = 256;
     const int KC = 256;
-    const int NC = 144;
+    const int NC = 256; // Increased from 144
 
     static float* packedA = (float*)alloc_aligned(MC * KC * sizeof(float));
     static float* packedB = (float*)alloc_aligned(KC * NC * sizeof(float));
@@ -326,27 +333,46 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
             for (int i = i0; i < i_lim; i += MR) {
                 pack_A(k, A, k, i, m, p0, p_lim, &packedA[(i - i0) * (p_lim - p0)]); // Pass m, not i_lim
             }
+        }
+        
+        for (int j0 = 0; j0 < n; j0 += NC) {
+            int j_lim = std::min(n, j0 + NC);
 
-            for (int j0 = 0; j0 < n; j0 += NC) {
-                int j_lim = std::min(n, j0 + NC);
-
-                int j = j0;
-                for (; j <= j_lim - NR; j += NR) {
-                    pack_B(k, B, n, p0, p_lim, j, j + NR, NR, packedB);
-                    
-                    for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x16(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
-                    }
+            // Pack B for the whole j0..j_lim strip
+            float* b_pack_ptr = packedB;
+            for (int j = j0; j < j_lim; j += NR) {
+                int current_nr = std::min(NR, j_lim - j);
+                if (current_nr == 16) {
+                    pack_B(k, B, n, p0, p_lim, j, j + 16, 16, b_pack_ptr);
+                } else {
+                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 }
+                b_pack_ptr += (p_lim - p0) * 16;
+            }
+
+            const float* p0_a_ptr = packedA;
+            for (int i0 = 0; i0 < m_padded; i0 += MC) {
+                int i_lim = std::min(m_padded, i0 + MC);
                 
-                if (j < j_lim) {
-                    int remain = j_lim - j;
-                    pack_B(k, B, n, p0, p_lim, j, j + remain, 16, packedB); // Pad to 16
-                    __mmask16 mask = (1 << remain) - 1;
+                const float* current_a_block = p0_a_ptr;
+                size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
+                p0_a_ptr += block_size;
+
+                float* current_b_ptr = packedB;
+                for (int j = j0; j < j_lim; j += NR) {
+                    int current_nr = std::min(NR, j_lim - j);
                     
-                    for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x16_masked(p_lim - p0, &packedA[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n, mask);
+                    if (current_nr == 16) {
+                        for (int i = i0; i < i_lim; i += MR) {
+                            kernel_16x16(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], current_b_ptr, &C[i * n + j], n);
+                        }
+                    } else {
+                        __mmask16 mask = (1 << current_nr) - 1;
+                        for (int i = i0; i < i_lim; i += MR) {
+                            kernel_16x16_masked(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], current_b_ptr, &C[i * n + j], n, mask);
+                        }
                     }
+                    current_b_ptr += (p_lim - p0) * 16;
                 }
             }
         }
@@ -408,7 +434,7 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
 
     const int MC = 256;
     const int KC = 256;
-    const int NC = 144;
+    const int NC = 256;
 
     if (n == 1) {
         // Optimized path for GEMV (n=1)
@@ -440,35 +466,52 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
     for (int p0 = 0; p0 < k; p0 += KC) {
         int p_lim = std::min(k, p0 + KC);
         
-        for (int i0 = 0; i0 < m_padded; i0 += MC) {
-            int i_lim = std::min(m_padded, i0 + MC);
-            
-            const float* current_a_block = a_ptr;
-            size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
-            a_ptr += block_size;
+        for (int j0 = 0; j0 < n; j0 += NC) {
+            int j_lim = std::min(n, j0 + NC);
 
-            for (int j0 = 0; j0 < n; j0 += NC) {
-                int j_lim = std::min(n, j0 + NC);
-
-                int j = j0;
-                for (; j <= j_lim - NR; j += NR) {
-                    pack_B(k, B, n, p0, p_lim, j, j + NR, NR, packedB);
-                    
-                    for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x16(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n);
-                    }
+            // Pack B for the whole j0..j_lim strip
+            float* b_pack_ptr = packedB;
+            for (int j = j0; j < j_lim; j += NR) {
+                int current_nr = std::min(NR, j_lim - j);
+                if (current_nr == 16) {
+                    pack_B(k, B, n, p0, p_lim, j, j + 16, 16, b_pack_ptr);
+                } else {
+                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 }
+                b_pack_ptr += (p_lim - p0) * 16;
+            }
+
+            const float* p0_a_ptr = a_ptr;
+            for (int i0 = 0; i0 < m_padded; i0 += MC) {
+                int i_lim = std::min(m_padded, i0 + MC);
                 
-                if (j < j_lim) {
-                    int remain = j_lim - j;
-                    pack_B(k, B, n, p0, p_lim, j, j + remain, 16, packedB); // Pad to 16
-                    __mmask16 mask = (1 << remain) - 1;
+                const float* current_a_block = p0_a_ptr;
+                size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
+                p0_a_ptr += block_size;
+
+                float* current_b_ptr = packedB;
+                for (int j = j0; j < j_lim; j += NR) {
+                    int current_nr = std::min(NR, j_lim - j);
                     
-                    for (int i = i0; i < i_lim; i += MR) {
-                        kernel_16x16_masked(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], packedB, &C[i * n + j], n, mask);
+                    if (current_nr == 16) {
+                        for (int i = i0; i < i_lim; i += MR) {
+                            kernel_16x16(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], current_b_ptr, &C[i * n + j], n);
+                        }
+                    } else {
+                        __mmask16 mask = (1 << current_nr) - 1;
+                        for (int i = i0; i < i_lim; i += MR) {
+                            kernel_16x16_masked(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], current_b_ptr, &C[i * n + j], n, mask);
+                        }
                     }
+                    current_b_ptr += (p_lim - p0) * 16;
                 }
             }
+        }
+        
+        // Advance a_ptr by the total size of A strip
+        for (int i0 = 0; i0 < m_padded; i0 += MC) {
+             int i_lim = std::min(m_padded, i0 + MC);
+             a_ptr += (size_t)(i_lim - i0) * (p_lim - p0);
         }
     }
 }
