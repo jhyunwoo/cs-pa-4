@@ -15,7 +15,7 @@
 // Helper for aligned allocation
 void* alloc_aligned(size_t size) {
     void* ptr;
-    if (posix_memalign(&ptr, 32, size)) return nullptr;
+    if (posix_memalign(&ptr, 64, size)) return nullptr;
     return ptr;
 }
 
@@ -53,13 +53,17 @@ float* softmax(const float* x, int size) {
     return y;
 }
 
-float* transpose(const float* M, int rows, int cols) {
-    float* T = new float[cols * rows];
+void transpose(const float* M, int rows, int cols, float* T) {
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols; j++) {
             T[j * rows + i] = M[i * cols + j];
         }
     }
+}
+
+float* transpose(const float* M, int rows, int cols) {
+    float* T = new float[cols * rows];
+    transpose(M, rows, cols, T);
     return T;
 }
 
@@ -292,12 +296,12 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     return C;
 }
 
-float* matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n) {
+void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n, float* C) {
     const int MR = 16;
     const int NR = 16;
     
     int m_padded = (m + MR - 1) & ~(MR - 1);
-    float* C = new float[m_padded * n];
+    // C must be pre-allocated with size m_padded * n
     std::fill(C, C + m_padded * n, 0.0f);
 
     const int MC = 256;
@@ -343,7 +347,6 @@ float* matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, cons
         }
     }
     
-    return C;
 }
 
 float* pack_matrix_A(int m, int k, const float* A) {
@@ -393,6 +396,8 @@ struct Linear {
     float* W;
     float* packedW; // Pre-packed weights
 
+    mutable std::vector<float> workspace;
+
     Linear(int in_dim, int out_dim, float* weights)
         : in_dim(in_dim), out_dim(out_dim), W(weights) {
         packedW = pack_matrix_A(out_dim, in_dim, W);
@@ -404,13 +409,32 @@ struct Linear {
     }
 
     float* forward(const float* x, int batch_size) const {
-        float* x_transposed = transpose(x, batch_size, in_dim);
+        if (batch_size == 1) {
+            // Optimization for generation phase:
+            // x (1 x in) and x^T (in x 1) have the same memory layout.
+            // y (out x 1) and y^T (1 x out) have the same memory layout.
+            // We can skip transposes and intermediate buffers.
+            float* y = new float[out_dim];
+            matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x, 1, y);
+            return y;
+        }
+
+        // Calculate required size: in_dim * batch_size + out_dim * batch_size
+        // We need space for x_transposed (in * batch) and y (out * batch)
+        // Note: m_padded might be slightly larger than out_dim, but we can just alloc enough.
+        int m_padded = (out_dim + 15) & ~15;
+        size_t required = (size_t)in_dim * batch_size + (size_t)m_padded * batch_size;
+        if (workspace.size() < required) workspace.resize(required);
+        
+        float* x_transposed = workspace.data();
+        float* y = workspace.data() + in_dim * batch_size;
+
+        transpose(x, batch_size, in_dim, x_transposed);
+        
         // Use pre-packed weights
-        float* y = matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x_transposed, batch_size);
-        delete[] x_transposed;
-        float* y_transposed = transpose(y, out_dim, batch_size);
-        delete[] y;
-        return y_transposed;
+        matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x_transposed, batch_size, y);
+        
+        return transpose(y, out_dim, batch_size);
     }
 };
 
@@ -456,29 +480,32 @@ struct FeedForward {
 
 struct SelfAttention {
     int d_model;
-    float* Wq;
-    float* Wk;
-    float* Wv;
-    float* Wo;
+    Linear q_proj;
+    Linear k_proj;
+    Linear v_proj;
+    Linear o_proj;
 
     SelfAttention(int d_model, [[maybe_unused]] int n_head_unused, float* Wq_weights, float* Wk_weights,
                   float* Wv_weights, float* Wo_weights)
         : d_model(d_model),
-          Wq(Wq_weights),
-          Wk(Wk_weights),
-          Wv(Wv_weights),
-          Wo(Wo_weights) {}
-
-    ~SelfAttention() {
-        delete[] Wq;
-        delete[] Wk;
-        delete[] Wv;
+          q_proj(d_model, d_model, transpose(Wq_weights, d_model, d_model)),
+          k_proj(d_model, d_model, transpose(Wk_weights, d_model, d_model)),
+          v_proj(d_model, d_model, transpose(Wv_weights, d_model, d_model)),
+          o_proj(d_model, d_model, transpose(Wo_weights, d_model, d_model)) {
+        // Linear takes ownership of the transposed weights.
+        // We must delete the original weights passed in.
+        delete[] Wq_weights;
+        delete[] Wk_weights;
+        delete[] Wv_weights;
+        delete[] Wo_weights;
     }
 
+    // Linear destructors will handle cleanup of their weights
+
     float* forward(const float* x, int T) {
-        float* Q = matrix_matrix_multiply(x, T, d_model, Wq, d_model);
-        float* K = matrix_matrix_multiply(x, T, d_model, Wk, d_model);
-        float* V = matrix_matrix_multiply(x, T, d_model, Wv, d_model);
+        float* Q = q_proj.forward(x, T);
+        float* K = k_proj.forward(x, T);
+        float* V = v_proj.forward(x, T);
 
         float* KT = transpose(K, T, d_model);
         float* scores = matrix_matrix_multiply(Q, T, d_model, KT, T);
@@ -504,7 +531,7 @@ struct SelfAttention {
         delete[] K;
         delete[] V;
 
-        float* out_proj = matrix_matrix_multiply(out, T, d_model, Wo, d_model);
+        float* out_proj = o_proj.forward(out, T);
 
         delete[] out;
         return out_proj;
