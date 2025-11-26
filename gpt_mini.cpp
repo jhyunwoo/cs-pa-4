@@ -12,18 +12,22 @@
 
 #include <immintrin.h>
 
+// Force aggressive optimization for this file
+// #pragma GCC optimize("O3,unroll-loops")
+
 // Helper for aligned allocation
-void* alloc_aligned(size_t size) {
+static inline void* alloc_aligned(size_t size) {
     void* ptr;
     if (posix_memalign(&ptr, 64, size)) return nullptr;
     return ptr;
 }
 
-void free_aligned(void* ptr) {
+static inline void free_aligned(void* ptr) {
     free(ptr);
 }
 
 using std::max;
+using std::min;
 using std::unique_ptr;
 using std::vector;
 
@@ -49,16 +53,17 @@ float* softmax(const float* x, int size) {
         y[i] = std::exp(x[i] - maxv);
         sum += y[i];
     }
-    for (int i = 0; i < size; i++) y[i] /= sum;
+    float inv = 1.0f / sum;
+    for (int i = 0; i < size; i++) y[i] *= inv;
     return y;
 }
 
-void transpose(const float* M, int rows, int cols, float* T) {
+void transpose(const float* __restrict__ M, int rows, int cols, float* __restrict__ T) {
     const int BLOCK = 32;
     for (int i = 0; i < rows; i += BLOCK) {
         for (int j = 0; j < cols; j += BLOCK) {
-            int i_lim = std::min(rows, i + BLOCK);
-            int j_lim = std::min(cols, j + BLOCK);
+            int i_lim = min(rows, i + BLOCK);
+            int j_lim = min(cols, j + BLOCK);
             for (int ii = i; ii < i_lim; ++ii) {
                 for (int jj = j; jj < j_lim; ++jj) {
                     T[jj * rows + ii] = M[ii * cols + jj];
@@ -74,20 +79,40 @@ float* transpose(const float* M, int rows, int cols) {
     return T;
 }
 
-// === Need to Optimize === //
+// ==================== Optimized Matrix Multiplication ====================
 
-void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, int ldc) {
-    __m512 c[16];
-    
-    // Load C rows (contiguous)
-    for (int i = 0; i < 16; ++i) c[i] = _mm512_loadu_ps(C + i * ldc);
+// Micro-kernel: 16x16 using AVX-512 with 8-unrolling
+// Uses all 32 ZMM registers effectively
+__attribute__((always_inline, hot))
+inline void kernel_16x16(int k, const float* __restrict__ packedA, 
+                         const float* __restrict__ packedB, 
+                         float* __restrict__ C, int ldc) {
+    __m512 c0  = _mm512_loadu_ps(C + 0*ldc);
+    __m512 c1  = _mm512_loadu_ps(C + 1*ldc);
+    __m512 c2  = _mm512_loadu_ps(C + 2*ldc);
+    __m512 c3  = _mm512_loadu_ps(C + 3*ldc);
+    __m512 c4  = _mm512_loadu_ps(C + 4*ldc);
+    __m512 c5  = _mm512_loadu_ps(C + 5*ldc);
+    __m512 c6  = _mm512_loadu_ps(C + 6*ldc);
+    __m512 c7  = _mm512_loadu_ps(C + 7*ldc);
+    __m512 c8  = _mm512_loadu_ps(C + 8*ldc);
+    __m512 c9  = _mm512_loadu_ps(C + 9*ldc);
+    __m512 c10 = _mm512_loadu_ps(C + 10*ldc);
+    __m512 c11 = _mm512_loadu_ps(C + 11*ldc);
+    __m512 c12 = _mm512_loadu_ps(C + 12*ldc);
+    __m512 c13 = _mm512_loadu_ps(C + 13*ldc);
+    __m512 c14 = _mm512_loadu_ps(C + 14*ldc);
+    __m512 c15 = _mm512_loadu_ps(C + 15*ldc);
 
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
 
     int p = 0;
     for (; p <= k - 8; p += 8) {
-        // Load B rows (contiguous)
+        // Prefetch next block
+        _mm_prefetch((const char*)(b_ptr + 256), _MM_HINT_T0);
+        _mm_prefetch((const char*)(a_ptr + 256), _MM_HINT_T0);
+        
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
@@ -96,61 +121,108 @@ void kernel_16x16(int k, const float* packedA, const float* packedB, float* C, i
         __m512 b5 = _mm512_load_ps(b_ptr + 80);
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
-        b_ptr += 128;
+
+        // Process all 16 rows with 8 k-iterations
+        #define PROCESS_ROW(row) \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row]), b0, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 16]), b1, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 32]), b2, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 48]), b3, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 64]), b4, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 80]), b5, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 96]), b6, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 112]), b7, c##row);
+
+        PROCESS_ROW(0)
+        PROCESS_ROW(1)
+        PROCESS_ROW(2)
+        PROCESS_ROW(3)
+        PROCESS_ROW(4)
+        PROCESS_ROW(5)
+        PROCESS_ROW(6)
+        PROCESS_ROW(7)
+        PROCESS_ROW(8)
+        PROCESS_ROW(9)
+        PROCESS_ROW(10)
+        PROCESS_ROW(11)
+        PROCESS_ROW(12)
+        PROCESS_ROW(13)
+        PROCESS_ROW(14)
+        PROCESS_ROW(15)
         
-        #pragma GCC unroll 16
-        for (int i = 0; i < 16; ++i) {
-            // Broadcast A[i, p...p+7]
-            __m512 a0 = _mm512_set1_ps(a_ptr[i]);
-            __m512 a1 = _mm512_set1_ps(a_ptr[i + 16]);
-            __m512 a2 = _mm512_set1_ps(a_ptr[i + 32]);
-            __m512 a3 = _mm512_set1_ps(a_ptr[i + 48]);
-            __m512 a4 = _mm512_set1_ps(a_ptr[i + 64]);
-            __m512 a5 = _mm512_set1_ps(a_ptr[i + 80]);
-            __m512 a6 = _mm512_set1_ps(a_ptr[i + 96]);
-            __m512 a7 = _mm512_set1_ps(a_ptr[i + 112]);
-            
-            c[i] = _mm512_fmadd_ps(a0, b0, c[i]);
-            c[i] = _mm512_fmadd_ps(a1, b1, c[i]);
-            c[i] = _mm512_fmadd_ps(a2, b2, c[i]);
-            c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
-            c[i] = _mm512_fmadd_ps(a4, b4, c[i]);
-            c[i] = _mm512_fmadd_ps(a5, b5, c[i]);
-            c[i] = _mm512_fmadd_ps(a6, b6, c[i]);
-            c[i] = _mm512_fmadd_ps(a7, b7, c[i]);
-        }
+        #undef PROCESS_ROW
+
+        b_ptr += 128;
         a_ptr += 128;
     }
     
-    // Cleanup loop
     for (; p < k; ++p) {
         __m512 b = _mm512_load_ps(b_ptr);
         b_ptr += 16;
         
-        #pragma GCC unroll 16
-        for (int i = 0; i < 16; ++i) {
-            __m512 a = _mm512_set1_ps(a_ptr[i]);
-            c[i] = _mm512_fmadd_ps(a, b, c[i]);
-        }
+        c0  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
+        c1  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
+        c2  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
+        c3  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
+        c4  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
+        c5  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
+        c6  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
+        c7  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
+        c8  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
+        c9  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
+        c10 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[10]), b, c10);
+        c11 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[11]), b, c11);
+        c12 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[12]), b, c12);
+        c13 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[13]), b, c13);
+        c14 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[14]), b, c14);
+        c15 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[15]), b, c15);
         a_ptr += 16;
     }
 
-    // Store C rows (contiguous)
-    for (int i = 0; i < 16; ++i) _mm512_storeu_ps(C + i * ldc, c[i]);
+    _mm512_storeu_ps(C + 0*ldc, c0);
+    _mm512_storeu_ps(C + 1*ldc, c1);
+    _mm512_storeu_ps(C + 2*ldc, c2);
+    _mm512_storeu_ps(C + 3*ldc, c3);
+    _mm512_storeu_ps(C + 4*ldc, c4);
+    _mm512_storeu_ps(C + 5*ldc, c5);
+    _mm512_storeu_ps(C + 6*ldc, c6);
+    _mm512_storeu_ps(C + 7*ldc, c7);
+    _mm512_storeu_ps(C + 8*ldc, c8);
+    _mm512_storeu_ps(C + 9*ldc, c9);
+    _mm512_storeu_ps(C + 10*ldc, c10);
+    _mm512_storeu_ps(C + 11*ldc, c11);
+    _mm512_storeu_ps(C + 12*ldc, c12);
+    _mm512_storeu_ps(C + 13*ldc, c13);
+    _mm512_storeu_ps(C + 14*ldc, c14);
+    _mm512_storeu_ps(C + 15*ldc, c15);
 }
 
-void kernel_16x16_masked(int k, const float* packedA, const float* packedB, float* C, int ldc, __mmask16 mask) {
-    __m512 c[16];
-    
-    // Load C rows (contiguous)
-    for (int i = 0; i < 16; ++i) c[i] = _mm512_maskz_loadu_ps(mask, C + i * ldc);
+__attribute__((always_inline, hot))
+inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, 
+                                const float* __restrict__ packedB, 
+                                float* __restrict__ C, int ldc, __mmask16 mask) {
+    __m512 c0  = _mm512_maskz_loadu_ps(mask, C + 0*ldc);
+    __m512 c1  = _mm512_maskz_loadu_ps(mask, C + 1*ldc);
+    __m512 c2  = _mm512_maskz_loadu_ps(mask, C + 2*ldc);
+    __m512 c3  = _mm512_maskz_loadu_ps(mask, C + 3*ldc);
+    __m512 c4  = _mm512_maskz_loadu_ps(mask, C + 4*ldc);
+    __m512 c5  = _mm512_maskz_loadu_ps(mask, C + 5*ldc);
+    __m512 c6  = _mm512_maskz_loadu_ps(mask, C + 6*ldc);
+    __m512 c7  = _mm512_maskz_loadu_ps(mask, C + 7*ldc);
+    __m512 c8  = _mm512_maskz_loadu_ps(mask, C + 8*ldc);
+    __m512 c9  = _mm512_maskz_loadu_ps(mask, C + 9*ldc);
+    __m512 c10 = _mm512_maskz_loadu_ps(mask, C + 10*ldc);
+    __m512 c11 = _mm512_maskz_loadu_ps(mask, C + 11*ldc);
+    __m512 c12 = _mm512_maskz_loadu_ps(mask, C + 12*ldc);
+    __m512 c13 = _mm512_maskz_loadu_ps(mask, C + 13*ldc);
+    __m512 c14 = _mm512_maskz_loadu_ps(mask, C + 14*ldc);
+    __m512 c15 = _mm512_maskz_loadu_ps(mask, C + 15*ldc);
 
     const float* b_ptr = packedB;
     const float* a_ptr = packedA;
 
     int p = 0;
     for (; p <= k - 8; p += 8) {
-        // Load B rows (contiguous)
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
@@ -159,67 +231,84 @@ void kernel_16x16_masked(int k, const float* packedA, const float* packedB, floa
         __m512 b5 = _mm512_load_ps(b_ptr + 80);
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
-        b_ptr += 128;
+
+        #define PROCESS_ROW(row) \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row]), b0, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 16]), b1, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 32]), b2, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 48]), b3, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 64]), b4, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 80]), b5, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 96]), b6, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 112]), b7, c##row);
+
+        PROCESS_ROW(0) PROCESS_ROW(1) PROCESS_ROW(2) PROCESS_ROW(3)
+        PROCESS_ROW(4) PROCESS_ROW(5) PROCESS_ROW(6) PROCESS_ROW(7)
+        PROCESS_ROW(8) PROCESS_ROW(9) PROCESS_ROW(10) PROCESS_ROW(11)
+        PROCESS_ROW(12) PROCESS_ROW(13) PROCESS_ROW(14) PROCESS_ROW(15)
         
-        #pragma GCC unroll 16
-        for (int i = 0; i < 16; ++i) {
-            // Broadcast A[i, p...p+7]
-            __m512 a0 = _mm512_set1_ps(a_ptr[i]);
-            __m512 a1 = _mm512_set1_ps(a_ptr[i + 16]);
-            __m512 a2 = _mm512_set1_ps(a_ptr[i + 32]);
-            __m512 a3 = _mm512_set1_ps(a_ptr[i + 48]);
-            __m512 a4 = _mm512_set1_ps(a_ptr[i + 64]);
-            __m512 a5 = _mm512_set1_ps(a_ptr[i + 80]);
-            __m512 a6 = _mm512_set1_ps(a_ptr[i + 96]);
-            __m512 a7 = _mm512_set1_ps(a_ptr[i + 112]);
-            
-            c[i] = _mm512_fmadd_ps(a0, b0, c[i]);
-            c[i] = _mm512_fmadd_ps(a1, b1, c[i]);
-            c[i] = _mm512_fmadd_ps(a2, b2, c[i]);
-            c[i] = _mm512_fmadd_ps(a3, b3, c[i]);
-            c[i] = _mm512_fmadd_ps(a4, b4, c[i]);
-            c[i] = _mm512_fmadd_ps(a5, b5, c[i]);
-            c[i] = _mm512_fmadd_ps(a6, b6, c[i]);
-            c[i] = _mm512_fmadd_ps(a7, b7, c[i]);
-        }
+        #undef PROCESS_ROW
+
+        b_ptr += 128;
         a_ptr += 128;
     }
     
-    // Cleanup loop
     for (; p < k; ++p) {
         __m512 b = _mm512_load_ps(b_ptr);
         b_ptr += 16;
         
-        #pragma GCC unroll 16
-        for (int i = 0; i < 16; ++i) {
-            __m512 a = _mm512_set1_ps(a_ptr[i]);
-            c[i] = _mm512_fmadd_ps(a, b, c[i]);
-        }
+        c0  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
+        c1  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
+        c2  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
+        c3  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
+        c4  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
+        c5  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
+        c6  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
+        c7  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
+        c8  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
+        c9  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
+        c10 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[10]), b, c10);
+        c11 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[11]), b, c11);
+        c12 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[12]), b, c12);
+        c13 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[13]), b, c13);
+        c14 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[14]), b, c14);
+        c15 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[15]), b, c15);
         a_ptr += 16;
     }
 
-    // Store C rows (contiguous)
-    for (int i = 0; i < 16; ++i) _mm512_mask_storeu_ps(C + i * ldc, mask, c[i]);
+    _mm512_mask_storeu_ps(C + 0*ldc, mask, c0);
+    _mm512_mask_storeu_ps(C + 1*ldc, mask, c1);
+    _mm512_mask_storeu_ps(C + 2*ldc, mask, c2);
+    _mm512_mask_storeu_ps(C + 3*ldc, mask, c3);
+    _mm512_mask_storeu_ps(C + 4*ldc, mask, c4);
+    _mm512_mask_storeu_ps(C + 5*ldc, mask, c5);
+    _mm512_mask_storeu_ps(C + 6*ldc, mask, c6);
+    _mm512_mask_storeu_ps(C + 7*ldc, mask, c7);
+    _mm512_mask_storeu_ps(C + 8*ldc, mask, c8);
+    _mm512_mask_storeu_ps(C + 9*ldc, mask, c9);
+    _mm512_mask_storeu_ps(C + 10*ldc, mask, c10);
+    _mm512_mask_storeu_ps(C + 11*ldc, mask, c11);
+    _mm512_mask_storeu_ps(C + 12*ldc, mask, c12);
+    _mm512_mask_storeu_ps(C + 13*ldc, mask, c13);
+    _mm512_mask_storeu_ps(C + 14*ldc, mask, c14);
+    _mm512_mask_storeu_ps(C + 15*ldc, mask, c15);
 }
 
-void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
+__attribute__((always_inline))
+inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
-
     
-    // Prepare gather indices
     int indices[16];
     for(int i=0; i<16; ++i) indices[i] = i * lda;
     __m512i vindex = _mm512_loadu_si512(indices);
 
     if (i0 + 16 <= i_max) {
-        // Fast path: unmasked gather
         for (int p = p0; p < p_max; ++p) {
             __m512 a = _mm512_i32gather_ps(vindex, &A[i0 * lda + p], 4);
             _mm512_store_ps(packed, a);
             packed += 16;
         }
     } else {
-        // Slow path: masked gather
         __mmask16 mask = (1 << (i_max - i0)) - 1;
         for (int p = p0; p < p_max; ++p) {
             __m512 a = _mm512_mask_i32gather_ps(_mm512_setzero_ps(), mask, vindex, &A[i0 * lda + p], 4);
@@ -229,7 +318,8 @@ void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max
     }
 }
 
-void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max, int nr, float* packed) {
+__attribute__((always_inline))
+inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max, int nr, float* packed) {
     (void)k;
     if (nr == 16 && j0 + 16 <= j_max) {
         for (int p = p0; p < p_max; ++p) {
@@ -250,7 +340,8 @@ void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max
     }
 }
 
-float dot_product(const float* A, const float* B, int k) {
+__attribute__((always_inline))
+inline float dot_product(const float* A, const float* B, int k) {
     __m512 sum0 = _mm512_setzero_ps();
     __m512 sum1 = _mm512_setzero_ps();
     __m512 sum2 = _mm512_setzero_ps();
@@ -266,7 +357,6 @@ float dot_product(const float* A, const float* B, int k) {
     
     __m512 sum = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
     
-    // Handle remaining 16-blocks
     for (; p <= k - 16; p += 16) {
         sum = _mm512_fmadd_ps(_mm512_loadu_ps(A + p), _mm512_loadu_ps(B + p), sum);
     }
@@ -278,7 +368,8 @@ float dot_product(const float* A, const float* B, int k) {
     return res;
 }
 
-void scale_vector(const float* src, float scale, int n, float* dst) {
+__attribute__((always_inline))
+inline void scale_vector(const float* src, float scale, int n, float* dst) {
     __m512 s = _mm512_set1_ps(scale);
     int j = 0;
     for (; j <= n - 64; j += 64) {
@@ -295,64 +386,73 @@ void scale_vector(const float* src, float scale, int n, float* dst) {
     }
 }
 
+// Block sizes tuned for Intel Xeon Gold 5218
+static constexpr int MR = 16;
+static constexpr int NR = 16;
+static constexpr int MC = 256;
+static constexpr int KC = 256;
+static constexpr int NC = 256;
+
 float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int n) {
-    // Fast path for dot product (m=1, n=1)
     if (m == 1 && n == 1) {
         float* C = new float[1];
         C[0] = dot_product(A, B, k);
         return C;
     }
 
-    // Fast path for scaling (m=1, k=1) -> C = A[0] * B
     if (m == 1 && k == 1) {
         float* C = new float[n];
         scale_vector(B, A[0], n, C);
         return C;
     }
 
-    const int MR = 16;
-    const int NR = 16;
-    
     int m_padded = (m + MR - 1) & ~(MR - 1);
     float* C = new float[m_padded * n];
     std::fill(C, C + m_padded * n, 0.0f);
 
-    const int MC = 256;
-    const int KC = 256;
-    const int NC = 256; // Increased from 144
-
-    static float* packedA = (float*)alloc_aligned(MC * KC * sizeof(float));
-    static float* packedB = (float*)alloc_aligned(KC * NC * sizeof(float));
+    static float* packedA = nullptr;
+    static float* packedB = nullptr;
+    static size_t packedA_size = 0;
+    static size_t packedB_size = 0;
+    
+    size_t needed_A = (size_t)MC * KC;
+    size_t needed_B = (size_t)KC * NC;
+    
+    if (packedA_size < needed_A) {
+        if (packedA) free_aligned(packedA);
+        packedA = (float*)alloc_aligned(needed_A * sizeof(float));
+        packedA_size = needed_A;
+    }
+    if (packedB_size < needed_B) {
+        if (packedB) free_aligned(packedB);
+        packedB = (float*)alloc_aligned(needed_B * sizeof(float));
+        packedB_size = needed_B;
+    }
 
     for (int p0 = 0; p0 < k; p0 += KC) {
-        int p_lim = std::min(k, p0 + KC);
+        int p_lim = min(k, p0 + KC);
         
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
-            int i_lim = std::min(m_padded, i0 + MC);
+            int i_lim = min(m_padded, i0 + MC);
             
             for (int i = i0; i < i_lim; i += MR) {
-                pack_A(k, A, k, i, m, p0, p_lim, &packedA[(i - i0) * (p_lim - p0)]); // Pass m, not i_lim
+                pack_A(k, A, k, i, m, p0, p_lim, &packedA[(i - i0) * (p_lim - p0)]);
             }
         }
         
         for (int j0 = 0; j0 < n; j0 += NC) {
-            int j_lim = std::min(n, j0 + NC);
+            int j_lim = min(n, j0 + NC);
 
-            // Pack B for the whole j0..j_lim strip
             float* b_pack_ptr = packedB;
             for (int j = j0; j < j_lim; j += NR) {
-                int current_nr = std::min(NR, j_lim - j);
-                if (current_nr == 16) {
-                    pack_B(k, B, n, p0, p_lim, j, j + 16, 16, b_pack_ptr);
-                } else {
-                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
-                }
+                int current_nr = min(NR, j_lim - j);
+                pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 b_pack_ptr += (p_lim - p0) * 16;
             }
 
             const float* p0_a_ptr = packedA;
             for (int i0 = 0; i0 < m_padded; i0 += MC) {
-                int i_lim = std::min(m_padded, i0 + MC);
+                int i_lim = min(m_padded, i0 + MC);
                 
                 const float* current_a_block = p0_a_ptr;
                 size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
@@ -360,7 +460,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
 
                 float* current_b_ptr = packedB;
                 for (int j = j0; j < j_lim; j += NR) {
-                    int current_nr = std::min(NR, j_lim - j);
+                    int current_nr = min(NR, j_lim - j);
                     
                     if (current_nr == 16) {
                         for (int i = i0; i < i_lim; i += MR) {
@@ -381,7 +481,8 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     return C;
 }
 
-void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
+__attribute__((always_inline, hot))
+inline void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
     __m512 c0 = _mm512_loadu_ps(C);
     __m512 c1 = _mm512_setzero_ps();
     __m512 c2 = _mm512_setzero_ps();
@@ -425,27 +526,25 @@ void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
 }
 
 void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n, float* C) {
-    const int MR = 16;
-    const int NR = 16;
-    
     int m_padded = (m + MR - 1) & ~(MR - 1);
-    // C must be pre-allocated with size m_padded * n
     std::fill(C, C + m_padded * n, 0.0f);
 
-    const int MC = 256;
-    const int KC = 256;
-    const int NC = 256;
+    static float* packedB = nullptr;
+    static size_t packedB_size = 0;
+    
+    size_t needed_B = (size_t)KC * NC;
+    if (packedB_size < needed_B) {
+        if (packedB) free_aligned(packedB);
+        packedB = (float*)alloc_aligned(needed_B * sizeof(float));
+        packedB_size = needed_B;
+    }
 
     if (n == 1) {
-        // Optimized path for GEMV (n=1)
-
-        
-        // Re-implementing loop to match pack_matrix_A order
         const float* a_ptr = packedA;
         for (int p0 = 0; p0 < k; p0 += KC) {
-            int p_lim = std::min(k, p0 + KC);
+            int p_lim = min(k, p0 + KC);
             for (int i0 = 0; i0 < m_padded; i0 += MC) {
-                int i_lim = std::min(m_padded, i0 + MC);
+                int i_lim = min(m_padded, i0 + MC);
                 
                 const float* current_a_block = a_ptr;
                 size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
@@ -459,31 +558,24 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
         return;
     }
 
-    static float* packedB = (float*)alloc_aligned(KC * NC * sizeof(float));
-
     const float* a_ptr = packedA;
 
     for (int p0 = 0; p0 < k; p0 += KC) {
-        int p_lim = std::min(k, p0 + KC);
+        int p_lim = min(k, p0 + KC);
         
         for (int j0 = 0; j0 < n; j0 += NC) {
-            int j_lim = std::min(n, j0 + NC);
+            int j_lim = min(n, j0 + NC);
 
-            // Pack B for the whole j0..j_lim strip
             float* b_pack_ptr = packedB;
             for (int j = j0; j < j_lim; j += NR) {
-                int current_nr = std::min(NR, j_lim - j);
-                if (current_nr == 16) {
-                    pack_B(k, B, n, p0, p_lim, j, j + 16, 16, b_pack_ptr);
-                } else {
-                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
-                }
+                int current_nr = min(NR, j_lim - j);
+                pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 b_pack_ptr += (p_lim - p0) * 16;
             }
 
             const float* p0_a_ptr = a_ptr;
             for (int i0 = 0; i0 < m_padded; i0 += MC) {
-                int i_lim = std::min(m_padded, i0 + MC);
+                int i_lim = min(m_padded, i0 + MC);
                 
                 const float* current_a_block = p0_a_ptr;
                 size_t block_size = (size_t)(i_lim - i0) * (p_lim - p0);
@@ -491,7 +583,7 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
 
                 float* current_b_ptr = packedB;
                 for (int j = j0; j < j_lim; j += NR) {
-                    int current_nr = std::min(NR, j_lim - j);
+                    int current_nr = min(NR, j_lim - j);
                     
                     if (current_nr == 16) {
                         for (int i = i0; i < i_lim; i += MR) {
@@ -508,26 +600,21 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
             }
         }
         
-        // Advance a_ptr by the total size of A strip
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
-             int i_lim = std::min(m_padded, i0 + MC);
+             int i_lim = min(m_padded, i0 + MC);
              a_ptr += (size_t)(i_lim - i0) * (p_lim - p0);
         }
     }
 }
 
 float* pack_matrix_A(int m, int k, const float* A) {
-    const int MC = 256;
-    const int KC = 256;
-    const int MR = 16;
-    
     int m_padded = (m + MR - 1) & ~(MR - 1);
 
     size_t total_size = 0;
     for (int p0 = 0; p0 < k; p0 += KC) {
-        int p_lim = std::min(k, p0 + KC);
+        int p_lim = min(k, p0 + KC);
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
-            int i_lim = std::min(m_padded, i0 + MC);
+            int i_lim = min(m_padded, i0 + MC);
             total_size += (size_t)(i_lim - i0) * (p_lim - p0);
         }
     }
@@ -536,9 +623,9 @@ float* pack_matrix_A(int m, int k, const float* A) {
     float* ptr = packed;
     
     for (int p0 = 0; p0 < k; p0 += KC) {
-        int p_lim = std::min(k, p0 + KC);
+        int p_lim = min(k, p0 + KC);
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
-            int i_lim = std::min(m_padded, i0 + MC);
+            int i_lim = min(m_padded, i0 + MC);
             
             for (int i = i0; i < i_lim; i += MR) {
                 pack_A(k, A, k, i, m, p0, p_lim, ptr);
@@ -549,11 +636,22 @@ float* pack_matrix_A(int m, int k, const float* A) {
     return packed;
 }
 
-// ======================= //
+// ==================== Neural Network Layers ====================
 
 float* relu(const float* input, int size) {
     float* output = new float[size];
-    for (int i = 0; i < size; i++) output[i] = max(0.0f, input[i]);
+    __m512 zero = _mm512_setzero_ps();
+    int i = 0;
+    for (; i <= size - 64; i += 64) {
+        _mm512_storeu_ps(output + i, _mm512_max_ps(zero, _mm512_loadu_ps(input + i)));
+        _mm512_storeu_ps(output + i + 16, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 16)));
+        _mm512_storeu_ps(output + i + 32, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 32)));
+        _mm512_storeu_ps(output + i + 48, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 48)));
+    }
+    for (; i <= size - 16; i += 16) {
+        _mm512_storeu_ps(output + i, _mm512_max_ps(zero, _mm512_loadu_ps(input + i)));
+    }
+    for (; i < size; i++) output[i] = max(0.0f, input[i]);
     return output;
 }
 
@@ -561,7 +659,7 @@ struct Linear {
     int in_dim;
     int out_dim;
     float* W;
-    float* packedW; // Pre-packed weights
+    float* packedW;
 
     mutable std::vector<float> workspace;
 
@@ -577,18 +675,11 @@ struct Linear {
 
     float* forward(const float* x, int batch_size) const {
         if (batch_size == 1) {
-            // Optimization for generation phase:
-            // x (1 x in) and x^T (in x 1) have the same memory layout.
-            // y (out x 1) and y^T (1 x out) have the same memory layout.
-            // We can skip transposes and intermediate buffers.
             float* y = new float[out_dim];
             matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x, 1, y);
             return y;
         }
 
-        // Calculate required size: in_dim * batch_size + out_dim * batch_size
-        // We need space for x_transposed (in * batch) and y (out * batch)
-        // Note: m_padded might be slightly larger than out_dim, but we can just alloc enough.
         int m_padded = (out_dim + 15) & ~15;
         size_t required = (size_t)in_dim * batch_size + (size_t)m_padded * batch_size;
         if (workspace.size() < required) workspace.resize(required);
@@ -597,8 +688,6 @@ struct Linear {
         float* y = workspace.data() + in_dim * batch_size;
 
         transpose(x, batch_size, in_dim, x_transposed);
-        
-        // Use pre-packed weights
         matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x_transposed, batch_size, y);
         
         return transpose(y, out_dim, batch_size);
@@ -616,14 +705,43 @@ struct LayerNorm {
     ~LayerNorm() { delete[] gamma; }
 
     float* forward(const float* x) const {
-        float mean = 0, var = 0;
-        for (int i = 0; i < dim; i++) mean += x[i];
+        __m512 vsum = _mm512_setzero_ps();
+        int i = 0;
+        for (; i <= dim - 16; i += 16) {
+            vsum = _mm512_add_ps(vsum, _mm512_loadu_ps(x + i));
+        }
+        float mean = _mm512_reduce_add_ps(vsum);
+        for (; i < dim; i++) mean += x[i];
         mean /= dim;
-        for (int i = 0; i < dim; i++) var += (x[i] - mean) * (x[i] - mean);
+
+        __m512 vmean = _mm512_set1_ps(mean);
+        __m512 vvar = _mm512_setzero_ps();
+        i = 0;
+        for (; i <= dim - 16; i += 16) {
+            __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(x + i), vmean);
+            vvar = _mm512_fmadd_ps(diff, diff, vvar);
+        }
+        float var = _mm512_reduce_add_ps(vvar);
+        for (; i < dim; i++) {
+            float diff = x[i] - mean;
+            var += diff * diff;
+        }
         var /= dim;
-        float stdv = std::sqrt(var + 1e-5f);
+        
+        float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        __m512 vinv_std = _mm512_set1_ps(inv_std);
+
         float* y = new float[dim];
-        for (int i = 0; i < dim; i++) y[i] = gamma[i] * (x[i] - mean) / stdv;
+        i = 0;
+        for (; i <= dim - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(x + i);
+            __m512 vg = _mm512_loadu_ps(gamma + i);
+            __m512 normalized = _mm512_mul_ps(_mm512_sub_ps(vx, vmean), vinv_std);
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(vg, normalized));
+        }
+        for (; i < dim; i++) {
+            y[i] = gamma[i] * (x[i] - mean) * inv_std;
+        }
         return y;
     }
 };
@@ -659,15 +777,11 @@ struct SelfAttention {
           k_proj(d_model, d_model, transpose(Wk_weights, d_model, d_model)),
           v_proj(d_model, d_model, transpose(Wv_weights, d_model, d_model)),
           o_proj(d_model, d_model, transpose(Wo_weights, d_model, d_model)) {
-        // Linear takes ownership of the transposed weights.
-        // We must delete the original weights passed in.
         delete[] Wq_weights;
         delete[] Wk_weights;
         delete[] Wv_weights;
         delete[] Wo_weights;
     }
-
-    // Linear destructors will handle cleanup of their weights
 
     float* forward(const float* x, int T) {
         float* Q = q_proj.forward(x, T);
@@ -676,7 +790,8 @@ struct SelfAttention {
 
         float* KT = transpose(K, T, d_model);
         float* scores = matrix_matrix_multiply(Q, T, d_model, KT, T);
-        for (int i = 0; i < T * T; i++) scores[i] /= std::sqrt(static_cast<float>(d_model));
+        float scale = 1.0f / std::sqrt(static_cast<float>(d_model));
+        for (int i = 0; i < T * T; i++) scores[i] *= scale;
         delete[] KT;
 
         float* attn = new float[T * T];
@@ -730,10 +845,16 @@ struct TransformerBlock {
         delete[] x_norm;
 
         float* out = new float[T * d_model];
-        for (int i = 0; i < T * d_model; i++) out[i] = x[i] + attn_out[i];
+        int size = T * d_model;
+        int i = 0;
+        for (; i <= size - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(x + i);
+            __m512 va = _mm512_loadu_ps(attn_out + i);
+            _mm512_storeu_ps(out + i, _mm512_add_ps(vx, va));
+        }
+        for (; i < size; i++) out[i] = x[i] + attn_out[i];
         delete[] attn_out;
 
-        float* final_out = new float[T * d_model];
         float* y_norm = new float[T * d_model];
         for (int t = 0; t < T; t++) {
             float* norm = ln2.forward(out + t * d_model);
@@ -743,7 +864,16 @@ struct TransformerBlock {
         
         float* f = ffn.forward(y_norm, T);
         delete[] y_norm;
-        for (int i = 0; i < T * d_model; i++) final_out[i] = out[i] + f[i];
+        
+        float* final_out = new float[T * d_model];
+        i = 0;
+        for (; i <= size - 16; i += 16) {
+            __m512 vo = _mm512_loadu_ps(out + i);
+            __m512 vf = _mm512_loadu_ps(f + i);
+            _mm512_storeu_ps(final_out + i, _mm512_add_ps(vo, vf));
+        }
+        for (; i < size; i++) final_out[i] = out[i] + f[i];
+        
         delete[] f;
         delete[] out;
         return final_out;
@@ -772,7 +902,7 @@ struct GPTMini::Impl {
           d_ff(d_ff),
           n_layer(n_layer),
           blocks(),
-          embed_W(embed_weights), // Changed initialization
+          embed_W(embed_weights),
           lm_head(d_model, vocab, lm_head_weights) {
         blocks.reserve(n_layer);
         for (int i = 0; i < n_layer; i++) {
