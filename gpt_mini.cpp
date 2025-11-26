@@ -595,22 +595,6 @@ float* pack_matrix_A(int m, int k, const float* A) {
 
 // ==================== Neural Network Layers ====================
 
-float* relu(const float* input, int size) {
-    float* output = new float[size];
-    __m512 zero = _mm512_setzero_ps();
-    int i = 0;
-    for (; i <= size - 64; i += 64) {
-        _mm512_storeu_ps(output + i, _mm512_max_ps(zero, _mm512_loadu_ps(input + i)));
-        _mm512_storeu_ps(output + i + 16, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 16)));
-        _mm512_storeu_ps(output + i + 32, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 32)));
-        _mm512_storeu_ps(output + i + 48, _mm512_max_ps(zero, _mm512_loadu_ps(input + i + 48)));
-    }
-    for (; i <= size - 16; i += 16) {
-        _mm512_storeu_ps(output + i, _mm512_max_ps(zero, _mm512_loadu_ps(input + i)));
-    }
-    for (; i < size; i++) output[i] = max(0.0f, input[i]);
-    return output;
-}
 
 struct Linear {
     int in_dim;
@@ -642,18 +626,26 @@ struct Linear {
     float* forward_gemv(const float* x) const {
         float* y = new float[out_dim];
         
-        // Process 4 output elements at a time
+        // Process 8 output elements at a time for better ILP
         int i = 0;
-        for (; i <= out_dim - 4; i += 4) {
+        for (; i <= out_dim - 8; i += 8) {
             __m512 sum0 = _mm512_setzero_ps();
             __m512 sum1 = _mm512_setzero_ps();
             __m512 sum2 = _mm512_setzero_ps();
             __m512 sum3 = _mm512_setzero_ps();
+            __m512 sum4 = _mm512_setzero_ps();
+            __m512 sum5 = _mm512_setzero_ps();
+            __m512 sum6 = _mm512_setzero_ps();
+            __m512 sum7 = _mm512_setzero_ps();
             
             const float* w0 = W + i * in_dim;
             const float* w1 = W + (i+1) * in_dim;
             const float* w2 = W + (i+2) * in_dim;
             const float* w3 = W + (i+3) * in_dim;
+            const float* w4 = W + (i+4) * in_dim;
+            const float* w5 = W + (i+5) * in_dim;
+            const float* w6 = W + (i+6) * in_dim;
+            const float* w7 = W + (i+7) * in_dim;
             
             int j = 0;
             for (; j <= in_dim - 16; j += 16) {
@@ -662,24 +654,35 @@ struct Linear {
                 sum1 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + j), vx, sum1);
                 sum2 = _mm512_fmadd_ps(_mm512_loadu_ps(w2 + j), vx, sum2);
                 sum3 = _mm512_fmadd_ps(_mm512_loadu_ps(w3 + j), vx, sum3);
+                sum4 = _mm512_fmadd_ps(_mm512_loadu_ps(w4 + j), vx, sum4);
+                sum5 = _mm512_fmadd_ps(_mm512_loadu_ps(w5 + j), vx, sum5);
+                sum6 = _mm512_fmadd_ps(_mm512_loadu_ps(w6 + j), vx, sum6);
+                sum7 = _mm512_fmadd_ps(_mm512_loadu_ps(w7 + j), vx, sum7);
             }
             
             float r0 = _mm512_reduce_add_ps(sum0);
             float r1 = _mm512_reduce_add_ps(sum1);
             float r2 = _mm512_reduce_add_ps(sum2);
             float r3 = _mm512_reduce_add_ps(sum3);
+            float r4 = _mm512_reduce_add_ps(sum4);
+            float r5 = _mm512_reduce_add_ps(sum5);
+            float r6 = _mm512_reduce_add_ps(sum6);
+            float r7 = _mm512_reduce_add_ps(sum7);
             
             for (; j < in_dim; j++) {
-                r0 += w0[j] * x[j];
-                r1 += w1[j] * x[j];
-                r2 += w2[j] * x[j];
-                r3 += w3[j] * x[j];
+                float xj = x[j];
+                r0 += w0[j] * xj;
+                r1 += w1[j] * xj;
+                r2 += w2[j] * xj;
+                r3 += w3[j] * xj;
+                r4 += w4[j] * xj;
+                r5 += w5[j] * xj;
+                r6 += w6[j] * xj;
+                r7 += w7[j] * xj;
             }
             
-            y[i] = r0;
-            y[i+1] = r1;
-            y[i+2] = r2;
-            y[i+3] = r3;
+            y[i] = r0; y[i+1] = r1; y[i+2] = r2; y[i+3] = r3;
+            y[i+4] = r4; y[i+5] = r5; y[i+6] = r6; y[i+7] = r7;
         }
         
         for (; i < out_dim; i++) {
@@ -718,13 +721,10 @@ struct Linear {
 
 struct LayerNorm {
     int dim;
-    float* gamma;
 
-    explicit LayerNorm(int dim) : dim(dim), gamma(new float[dim]) {
-        for (int i = 0; i < dim; i++) gamma[i] = 1.0f;
-    }
+    explicit LayerNorm(int dim) : dim(dim) {}
 
-    ~LayerNorm() { delete[] gamma; }
+    ~LayerNorm() {}
 
     float* forward(const float* x) const {
         __m512 vsum = _mm512_setzero_ps();
@@ -756,13 +756,11 @@ struct LayerNorm {
         float* y = new float[dim];
         i = 0;
         for (; i <= dim - 16; i += 16) {
-            __m512 vx = _mm512_loadu_ps(x + i);
-            __m512 vg = _mm512_loadu_ps(gamma + i);
-            __m512 normalized = _mm512_mul_ps(_mm512_sub_ps(vx, vmean), vinv_std);
-            _mm512_storeu_ps(y + i, _mm512_mul_ps(vg, normalized));
+            __m512 normalized = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(x + i), vmean), vinv_std);
+            _mm512_storeu_ps(y + i, normalized);
         }
         for (; i < dim; i++) {
-            y[i] = gamma[i] * (x[i] - mean) * inv_std;
+            y[i] = (x[i] - mean) * inv_std;
         }
         return y;
     }
@@ -771,16 +769,34 @@ struct LayerNorm {
 struct FeedForward {
     Linear fc1;
     Linear fc2;
+    mutable float* buffer;
+    mutable int buffer_size;
 
     FeedForward(int d_model, int d_ff, float* fc1_weights, float* fc2_weights)
-        : fc1(d_model, d_ff, fc1_weights), fc2(d_ff, d_model, fc2_weights) {}
+        : fc1(d_model, d_ff, fc1_weights), fc2(d_ff, d_model, fc2_weights),
+          buffer(nullptr), buffer_size(0) {}
+    
+    ~FeedForward() {
+        if (buffer) delete[] buffer;
+    }
 
     float* forward(const float* x, int batch_size) {
         float* h = fc1.forward(x, batch_size);
-        float* r = relu(h, batch_size * fc1.out_dim);
+        
+        // Fused ReLU - modify in place
+        int size = batch_size * fc1.out_dim;
+        __m512 zero = _mm512_setzero_ps();
+        int i = 0;
+        for (; i <= size - 16; i += 16) {
+            __m512 v = _mm512_loadu_ps(h + i);
+            _mm512_storeu_ps(h + i, _mm512_max_ps(zero, v));
+        }
+        for (; i < size; i++) {
+            if (h[i] < 0.0f) h[i] = 0.0f;
+        }
+        
+        float* o = fc2.forward(h, batch_size);
         delete[] h;
-        float* o = fc2.forward(r, batch_size);
-        delete[] r;
         return o;
     }
 };
