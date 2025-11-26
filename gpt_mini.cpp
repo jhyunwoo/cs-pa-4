@@ -12,7 +12,7 @@
 
 #include <immintrin.h>
 
-#pragma GCC optimize("O3,unroll-loops")
+#pragma GCC optimize("O3,unroll-loops,fast-math")
 
 static inline void* alloc_aligned(size_t size) {
     void* ptr;
@@ -44,15 +44,33 @@ int sample_from(const float* p, int size) {
 }
 
 float* softmax(const float* x, int size) {
-    float maxv = *std::max_element(x, x + size);
-    float sum = 0;
+    // Fast max with SIMD
+    float maxv = x[0];
+    int i = 1;
+    if (size >= 16) {
+        __m512 vmax = _mm512_loadu_ps(x);
+        for (i = 16; i <= size - 16; i += 16) {
+            vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(x + i));
+        }
+        maxv = _mm512_reduce_max_ps(vmax);
+    }
+    for (; i < size; i++) if (x[i] > maxv) maxv = x[i];
+    
     float* y = new float[size];
-    for (int i = 0; i < size; i++) {
+    float sum = 0;
+    for (i = 0; i < size; i++) {
         y[i] = std::exp(x[i] - maxv);
         sum += y[i];
     }
+    
+    // SIMD normalization
     float inv = 1.0f / sum;
-    for (int i = 0; i < size; i++) y[i] *= inv;
+    __m512 vinv = _mm512_set1_ps(inv);
+    i = 0;
+    for (; i <= size - 16; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(y + i), vinv));
+    }
+    for (; i < size; i++) y[i] *= inv;
     return y;
 }
 
@@ -378,7 +396,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
         scale_vector(B, A[0], n, C);
         return C;
     }
-
+    
     int m_padded = (m + MR - 1) & ~(MR - 1);
     float* C = new float[m_padded * n];
     std::fill(C, C + m_padded * n, 0.0f);
@@ -418,7 +436,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
             float* b_pack_ptr = packedB;
             for (int j = j0; j < j_lim; j += NR) {
                 int current_nr = min(NR, j_lim - j);
-                pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
+                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 b_pack_ptr += (p_lim - p0) * 16;
             }
 
@@ -526,7 +544,7 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
             float* b_pack_ptr = packedB;
             for (int j = j0; j < j_lim; j += NR) {
                 int current_nr = min(NR, j_lim - j);
-                pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
+                    pack_B(k, B, n, p0, p_lim, j, j + current_nr, 16, b_pack_ptr);
                 b_pack_ptr += (p_lim - p0) * 16;
             }
 
@@ -619,7 +637,7 @@ struct Linear {
     }
 
     ~Linear() { 
-        delete[] W;
+        delete[] W; 
         delete[] WT;
         free_aligned(packedW);
         delete[] gemv_output;
@@ -724,39 +742,37 @@ struct Linear {
 
 struct LayerNorm {
     int dim;
+    mutable float* buf;
 
-    explicit LayerNorm(int dim) : dim(dim) {}
+    explicit LayerNorm(int dim) : dim(dim), buf(new float[dim]) {}
 
-    ~LayerNorm() {}
+    ~LayerNorm() { delete[] buf; }
 
     float* forward(const float* x) const {
+        // Single pass: compute sum and sum of squares
         __m512 vsum = _mm512_setzero_ps();
+        __m512 vsum2 = _mm512_setzero_ps();
         int i = 0;
         for (; i <= dim - 16; i += 16) {
-            vsum = _mm512_add_ps(vsum, _mm512_loadu_ps(x + i));
+            __m512 vx = _mm512_loadu_ps(x + i);
+            vsum = _mm512_add_ps(vsum, vx);
+            vsum2 = _mm512_fmadd_ps(vx, vx, vsum2);
         }
-        float mean = _mm512_reduce_add_ps(vsum);
-        for (; i < dim; i++) mean += x[i];
-        mean /= dim;
-
-        __m512 vmean = _mm512_set1_ps(mean);
-        __m512 vvar = _mm512_setzero_ps();
-        i = 0;
-        for (; i <= dim - 16; i += 16) {
-            __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(x + i), vmean);
-            vvar = _mm512_fmadd_ps(diff, diff, vvar);
-        }
-        float var = _mm512_reduce_add_ps(vvar);
+        float sum = _mm512_reduce_add_ps(vsum);
+        float sum2 = _mm512_reduce_add_ps(vsum2);
         for (; i < dim; i++) {
-            float diff = x[i] - mean;
-            var += diff * diff;
+            sum += x[i];
+            sum2 += x[i] * x[i];
         }
-        var /= dim;
         
+        float mean = sum / dim;
+        float var = sum2 / dim - mean * mean;
         float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+        
+        __m512 vmean = _mm512_set1_ps(mean);
         __m512 vinv_std = _mm512_set1_ps(inv_std);
 
-        float* y = new float[dim];
+        float* y = buf;
         i = 0;
         for (; i <= dim - 16; i += 16) {
             __m512 normalized = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(x + i), vmean), vinv_std);
@@ -981,6 +997,12 @@ struct SelfAttention {
             __m512 va = _mm512_set1_ps(scores[0]);
             const float* v0 = v_cache;
             int p = 0;
+            for (; p <= d_model - 64; p += 64) {
+                _mm512_storeu_ps(out + p, _mm512_mul_ps(va, _mm512_loadu_ps(v0 + p)));
+                _mm512_storeu_ps(out + p + 16, _mm512_mul_ps(va, _mm512_loadu_ps(v0 + p + 16)));
+                _mm512_storeu_ps(out + p + 32, _mm512_mul_ps(va, _mm512_loadu_ps(v0 + p + 32)));
+                _mm512_storeu_ps(out + p + 48, _mm512_mul_ps(va, _mm512_loadu_ps(v0 + p + 48)));
+            }
             for (; p <= d_model - 16; p += 16) {
                 _mm512_storeu_ps(out + p, _mm512_mul_ps(va, _mm512_loadu_ps(v0 + p)));
             }
@@ -992,6 +1014,16 @@ struct SelfAttention {
             __m512 va = _mm512_set1_ps(scores[j]);
             const float* vj = v_cache + j * d_model;
             int p = 0;
+            for (; p <= d_model - 64; p += 64) {
+                __m512 vo0 = _mm512_loadu_ps(out + p);
+                __m512 vo1 = _mm512_loadu_ps(out + p + 16);
+                __m512 vo2 = _mm512_loadu_ps(out + p + 32);
+                __m512 vo3 = _mm512_loadu_ps(out + p + 48);
+                _mm512_storeu_ps(out + p, _mm512_fmadd_ps(va, _mm512_loadu_ps(vj + p), vo0));
+                _mm512_storeu_ps(out + p + 16, _mm512_fmadd_ps(va, _mm512_loadu_ps(vj + p + 16), vo1));
+                _mm512_storeu_ps(out + p + 32, _mm512_fmadd_ps(va, _mm512_loadu_ps(vj + p + 32), vo2));
+                _mm512_storeu_ps(out + p + 48, _mm512_fmadd_ps(va, _mm512_loadu_ps(vj + p + 48), vo3));
+            }
             for (; p <= d_model - 16; p += 16) {
                 __m512 vo = _mm512_loadu_ps(out + p);
                 _mm512_storeu_ps(out + p, _mm512_fmadd_ps(va, _mm512_loadu_ps(vj + p), vo));
@@ -1011,13 +1043,27 @@ struct TransformerBlock {
     FeedForward ffn;
     LayerNorm ln1;
     LayerNorm ln2;
+    int d_model;
+    
+    // Preallocated buffers for incremental forward
+    mutable float* out_buf;
+    mutable float* final_buf;
 
     TransformerBlock(int d_model, int n_head, int d_ff, float* Wq_weights, float* Wk_weights,
                      float* Wv_weights, float* Wo_weights, float* fc1_weights, float* fc2_weights)
         : attn(d_model, n_head, Wq_weights, Wk_weights, Wv_weights, Wo_weights),
           ffn(d_model, d_ff, fc1_weights, fc2_weights),
           ln1(d_model),
-          ln2(d_model) {}
+          ln2(d_model),
+          d_model(d_model) {
+        out_buf = new float[d_model];
+        final_buf = new float[d_model];
+    }
+    
+    ~TransformerBlock() {
+        delete[] out_buf;
+        delete[] final_buf;
+    }
     
     void reset_cache() {
         attn.reset_cache();
@@ -1029,7 +1075,6 @@ struct TransformerBlock {
         for (int t = 0; t < T; t++) {
             float* norm = ln1.forward(x + t * d_model);
             for (int i = 0; i < d_model; i++) x_norm[t * d_model + i] = norm[i];
-            delete[] norm;
         }
 
         float* attn_out = attn.forward_prefill(x_norm, T);
@@ -1050,7 +1095,6 @@ struct TransformerBlock {
         for (int t = 0; t < T; t++) {
             float* norm = ln2.forward(out + t * d_model);
             for (int i = 0; i < d_model; i++) y_norm[t * d_model + i] = norm[i];
-            delete[] norm;
         }
         
         float* f = ffn.forward(y_norm, T);
@@ -1071,12 +1115,12 @@ struct TransformerBlock {
     }
     
     // Incremental: process only the last token
-    float* forward_incremental(const float* x, int d_model) {
+    float* forward_incremental(const float* x) {
         float* x_norm = ln1.forward(x);
         float* attn_out = attn.forward_incremental(x_norm);
-        delete[] x_norm;
 
-        float* out = new float[d_model];
+        // Use preallocated buffer for intermediate result
+        float* out = out_buf;
         int i = 0;
         for (; i <= d_model - 16; i += 16) {
             __m512 vx = _mm512_loadu_ps(x + i);
@@ -1088,8 +1132,8 @@ struct TransformerBlock {
 
         float* y_norm = ln2.forward(out);
         float* f = ffn.forward(y_norm, 1);
-        delete[] y_norm;
         
+        // Allocate new output (caller will delete)
         float* final_out = new float[d_model];
         i = 0;
         for (; i <= d_model - 16; i += 16) {
@@ -1100,7 +1144,6 @@ struct TransformerBlock {
         for (; i < d_model; i++) final_out[i] = out[i] + f[i];
         
         delete[] f;
-        delete[] out;
         return final_out;
     }
 };
@@ -1172,20 +1215,20 @@ struct GPTMini::Impl {
             }
             
             // Embed all tokens
-            float* x = new float[T * d_model];
-            for (int t = 0; t < T; t++) {
+        float* x = new float[T * d_model];
+        for (int t = 0; t < T; t++) {
                 int id = context[t];
-                for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed_W[id * d_model + i];
-            }
-            
+            for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed_W[id * d_model + i];
+    }
+
             // Forward through all layers (prefill)
-            for (int layer = 0; layer < n_layer; ++layer) {
+        for (int layer = 0; layer < n_layer; ++layer) {
                 float* new_x = blocks[layer]->forward_prefill(x, T, d_model);
-                delete[] x;
-                x = new_x;
-            }
+            delete[] x;
+            x = new_x;
+        }
             
-            dump_layer_output(x, T, d_model);
+        dump_layer_output(x, T, d_model);
             
             // Store for incremental generation
             if (last_hidden_states) delete[] last_hidden_states;
@@ -1211,7 +1254,7 @@ struct GPTMini::Impl {
             
             // Forward through all layers (incremental)
             for (int layer = 0; layer < n_layer; ++layer) {
-                float* new_x = blocks[layer]->forward_incremental(x, d_model);
+                float* new_x = blocks[layer]->forward_incremental(x);
                 delete[] x;
                 x = new_x;
             }
