@@ -603,6 +603,7 @@ struct Linear {
     float* WT;  // Transposed weights for GEMV
     float* packedW;
     mutable std::vector<float> workspace;
+    mutable float* gemv_output;
 
     Linear(int in_dim, int out_dim, float* weights)
         : in_dim(in_dim), out_dim(out_dim), W(weights) {
@@ -614,12 +615,14 @@ struct Linear {
             }
         }
         packedW = pack_matrix_A(out_dim, in_dim, W);
+        gemv_output = new float[out_dim];
     }
 
     ~Linear() { 
         delete[] W;
         delete[] WT;
         free_aligned(packedW);
+        delete[] gemv_output;
     }
 
     // Optimized GEMV: y = W @ x where W is [out_dim, in_dim], x is [in_dim]
@@ -814,6 +817,12 @@ struct SelfAttention {
     mutable float* v_cache;
     mutable int cache_len;
     mutable int cache_capacity;
+    
+    // Preallocated buffers for incremental forward
+    mutable float* scores_buf;
+    mutable float* out_buf;
+    mutable int scores_capacity;
+    float scale;
 
     SelfAttention(int d_model, [[maybe_unused]] int n_head_unused, float* Wq_weights, float* Wk_weights,
                   float* Wv_weights, float* Wo_weights)
@@ -822,16 +831,21 @@ struct SelfAttention {
           k_proj(d_model, d_model, transpose(Wk_weights, d_model, d_model)),
           v_proj(d_model, d_model, transpose(Wv_weights, d_model, d_model)),
           o_proj(d_model, d_model, transpose(Wo_weights, d_model, d_model)),
-          k_cache(nullptr), v_cache(nullptr), cache_len(0), cache_capacity(0) {
+          k_cache(nullptr), v_cache(nullptr), cache_len(0), cache_capacity(0),
+          scores_buf(nullptr), out_buf(nullptr), scores_capacity(0),
+          scale(1.0f / std::sqrt(static_cast<float>(d_model))) {
         delete[] Wq_weights;
         delete[] Wk_weights;
         delete[] Wv_weights;
         delete[] Wo_weights;
+        out_buf = new float[d_model];
     }
     
     ~SelfAttention() {
         if (k_cache) delete[] k_cache;
         if (v_cache) delete[] v_cache;
+        if (scores_buf) delete[] scores_buf;
+        if (out_buf) delete[] out_buf;
     }
     
     void reset_cache() {
@@ -854,6 +868,11 @@ struct SelfAttention {
             k_cache = new_k;
             v_cache = new_v;
             cache_capacity = new_cap;
+        }
+        if (new_len > scores_capacity) {
+            if (scores_buf) delete[] scores_buf;
+            scores_buf = new float[new_len * 2];
+            scores_capacity = new_len * 2;
         }
     }
 
@@ -921,9 +940,8 @@ struct SelfAttention {
         delete[] k;
         delete[] v;
         
-        // Compute attention scores with SIMD
-        float* scores = new float[cache_len];
-        float scale = 1.0f / std::sqrt(static_cast<float>(d_model));
+        // Use preallocated scores buffer
+        float* scores = scores_buf;
         
         for (int j = 0; j < cache_len; j++) {
             __m512 sum = _mm512_setzero_ps();
@@ -955,8 +973,8 @@ struct SelfAttention {
         float inv_sum = 1.0f / sum;
         for (int j = 0; j < cache_len; j++) scores[j] *= inv_sum;
         
-        // Compute output with SIMD
-        float* out = new float[d_model];
+        // Use preallocated output buffer
+        float* out = out_buf;
         
         // Initialize output with first weighted V
         {
@@ -981,11 +999,9 @@ struct SelfAttention {
             for (; p < d_model; p++) out[p] += scores[j] * vj[p];
         }
         
-        delete[] scores;
         delete[] q;
         
         float* out_proj = o_proj.forward(out, 1);
-        delete[] out;
         return out_proj;
     }
 };
