@@ -616,24 +616,90 @@ struct Linear {
     int in_dim;
     int out_dim;
     float* W;
+    float* WT;  // Transposed weights for GEMV
     float* packedW;
     mutable std::vector<float> workspace;
 
     Linear(int in_dim, int out_dim, float* weights)
         : in_dim(in_dim), out_dim(out_dim), W(weights) {
+        // Create transposed weights for fast GEMV
+        WT = new float[in_dim * out_dim];
+        for (int i = 0; i < out_dim; i++) {
+            for (int j = 0; j < in_dim; j++) {
+                WT[j * out_dim + i] = W[i * in_dim + j];
+            }
+        }
         packedW = pack_matrix_A(out_dim, in_dim, W);
     }
 
     ~Linear() { 
-        delete[] W; 
+        delete[] W;
+        delete[] WT;
         free_aligned(packedW);
+    }
+
+    // Optimized GEMV: y = W @ x where W is [out_dim, in_dim], x is [in_dim]
+    float* forward_gemv(const float* x) const {
+        float* y = new float[out_dim];
+        
+        // Process 4 output elements at a time
+        int i = 0;
+        for (; i <= out_dim - 4; i += 4) {
+            __m512 sum0 = _mm512_setzero_ps();
+            __m512 sum1 = _mm512_setzero_ps();
+            __m512 sum2 = _mm512_setzero_ps();
+            __m512 sum3 = _mm512_setzero_ps();
+            
+            const float* w0 = W + i * in_dim;
+            const float* w1 = W + (i+1) * in_dim;
+            const float* w2 = W + (i+2) * in_dim;
+            const float* w3 = W + (i+3) * in_dim;
+            
+            int j = 0;
+            for (; j <= in_dim - 16; j += 16) {
+                __m512 vx = _mm512_loadu_ps(x + j);
+                sum0 = _mm512_fmadd_ps(_mm512_loadu_ps(w0 + j), vx, sum0);
+                sum1 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + j), vx, sum1);
+                sum2 = _mm512_fmadd_ps(_mm512_loadu_ps(w2 + j), vx, sum2);
+                sum3 = _mm512_fmadd_ps(_mm512_loadu_ps(w3 + j), vx, sum3);
+            }
+            
+            float r0 = _mm512_reduce_add_ps(sum0);
+            float r1 = _mm512_reduce_add_ps(sum1);
+            float r2 = _mm512_reduce_add_ps(sum2);
+            float r3 = _mm512_reduce_add_ps(sum3);
+            
+            for (; j < in_dim; j++) {
+                r0 += w0[j] * x[j];
+                r1 += w1[j] * x[j];
+                r2 += w2[j] * x[j];
+                r3 += w3[j] * x[j];
+            }
+            
+            y[i] = r0;
+            y[i+1] = r1;
+            y[i+2] = r2;
+            y[i+3] = r3;
+        }
+        
+        for (; i < out_dim; i++) {
+            __m512 sum = _mm512_setzero_ps();
+            const float* wi = W + i * in_dim;
+            int j = 0;
+            for (; j <= in_dim - 16; j += 16) {
+                sum = _mm512_fmadd_ps(_mm512_loadu_ps(wi + j), _mm512_loadu_ps(x + j), sum);
+            }
+            float r = _mm512_reduce_add_ps(sum);
+            for (; j < in_dim; j++) r += wi[j] * x[j];
+            y[i] = r;
+        }
+        
+        return y;
     }
 
     float* forward(const float* x, int batch_size) const {
         if (batch_size == 1) {
-            float* y = new float[out_dim];
-            matrix_matrix_multiply_prepacked(packedW, out_dim, in_dim, x, 1, y);
-            return y;
+            return forward_gemv(x);
         }
 
         int m_padded = (out_dim + 15) & ~15;
