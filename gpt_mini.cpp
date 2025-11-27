@@ -12,7 +12,7 @@
 
 #include <immintrin.h>
 
-#pragma GCC optimize("O3,unroll-loops,fast-math")
+#pragma GCC optimize("O3,unroll-loops,no-trapping-math,tree-vectorize")
 
 static inline void* alloc_aligned(size_t size) {
     void* ptr;
@@ -623,33 +623,42 @@ struct Linear {
     mutable std::vector<float> workspace;
     mutable float* gemv_output;
 
+    Linear(const Linear&) = delete;
+    Linear& operator=(const Linear&) = delete;
+
     Linear(int in_dim, int out_dim, float* weights)
-        : in_dim(in_dim), out_dim(out_dim), W(weights) {
+        : in_dim(in_dim), out_dim(out_dim) {
+        // Create copy of weights
+        W = new float[in_dim * out_dim];
+        size_t size = (size_t)in_dim * out_dim;
+        for (size_t i = 0; i < size; ++i) W[i] = weights[i];
+        
         // Create transposed weights for fast GEMV
         WT = new float[in_dim * out_dim];
-        for (int i = 0; i < out_dim; i++) {
-            for (int j = 0; j < in_dim; j++) {
-                WT[j * out_dim + i] = W[i * in_dim + j];
-            }
-        }
+        transpose(W, out_dim, in_dim, WT);
+        
         packedW = pack_matrix_A(out_dim, in_dim, W);
         gemv_output = new float[out_dim];
+        // fprintf(stderr, "Linear %p constructed, gemv_output %p\n", (void*)this, (void*)gemv_output);
+        
+        // Delete original weights as we own them now
+        delete[] weights;
     }
 
     ~Linear() { 
         delete[] W; 
         delete[] WT;
         free_aligned(packedW);
-        delete[] gemv_output;
     }
 
     // Optimized GEMV: y = W @ x where W is [out_dim, in_dim], x is [in_dim]
     float* forward_gemv(const float* x) const {
         float* y = new float[out_dim];
+        // fprintf(stderr, "Linear %p forward_gemv, gemv_output %p\n", (void*)this, (void*)y);
         
-        // Process 8 output elements at a time for better ILP
+        // Process 16 output elements at a time for better ILP
         int i = 0;
-        for (; i <= out_dim - 8; i += 8) {
+        for (; i <= out_dim - 16; i += 16) {
             __m512 sum0 = _mm512_setzero_ps();
             __m512 sum1 = _mm512_setzero_ps();
             __m512 sum2 = _mm512_setzero_ps();
@@ -658,6 +667,14 @@ struct Linear {
             __m512 sum5 = _mm512_setzero_ps();
             __m512 sum6 = _mm512_setzero_ps();
             __m512 sum7 = _mm512_setzero_ps();
+            __m512 sum8 = _mm512_setzero_ps();
+            __m512 sum9 = _mm512_setzero_ps();
+            __m512 sum10 = _mm512_setzero_ps();
+            __m512 sum11 = _mm512_setzero_ps();
+            __m512 sum12 = _mm512_setzero_ps();
+            __m512 sum13 = _mm512_setzero_ps();
+            __m512 sum14 = _mm512_setzero_ps();
+            __m512 sum15 = _mm512_setzero_ps();
             
             const float* w0 = W + i * in_dim;
             const float* w1 = W + (i+1) * in_dim;
@@ -667,10 +684,19 @@ struct Linear {
             const float* w5 = W + (i+5) * in_dim;
             const float* w6 = W + (i+6) * in_dim;
             const float* w7 = W + (i+7) * in_dim;
+            const float* w8 = W + (i+8) * in_dim;
+            const float* w9 = W + (i+9) * in_dim;
+            const float* w10 = W + (i+10) * in_dim;
+            const float* w11 = W + (i+11) * in_dim;
+            const float* w12 = W + (i+12) * in_dim;
+            const float* w13 = W + (i+13) * in_dim;
+            const float* w14 = W + (i+14) * in_dim;
+            const float* w15 = W + (i+15) * in_dim;
             
             int j = 0;
             for (; j <= in_dim - 16; j += 16) {
                 __m512 vx = _mm512_loadu_ps(x + j);
+                
                 sum0 = _mm512_fmadd_ps(_mm512_loadu_ps(w0 + j), vx, sum0);
                 sum1 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + j), vx, sum1);
                 sum2 = _mm512_fmadd_ps(_mm512_loadu_ps(w2 + j), vx, sum2);
@@ -679,31 +705,52 @@ struct Linear {
                 sum5 = _mm512_fmadd_ps(_mm512_loadu_ps(w5 + j), vx, sum5);
                 sum6 = _mm512_fmadd_ps(_mm512_loadu_ps(w6 + j), vx, sum6);
                 sum7 = _mm512_fmadd_ps(_mm512_loadu_ps(w7 + j), vx, sum7);
+                sum8 = _mm512_fmadd_ps(_mm512_loadu_ps(w8 + j), vx, sum8);
+                sum9 = _mm512_fmadd_ps(_mm512_loadu_ps(w9 + j), vx, sum9);
+                sum10 = _mm512_fmadd_ps(_mm512_loadu_ps(w10 + j), vx, sum10);
+                sum11 = _mm512_fmadd_ps(_mm512_loadu_ps(w11 + j), vx, sum11);
+                sum12 = _mm512_fmadd_ps(_mm512_loadu_ps(w12 + j), vx, sum12);
+                sum13 = _mm512_fmadd_ps(_mm512_loadu_ps(w13 + j), vx, sum13);
+                sum14 = _mm512_fmadd_ps(_mm512_loadu_ps(w14 + j), vx, sum14);
+                sum15 = _mm512_fmadd_ps(_mm512_loadu_ps(w15 + j), vx, sum15);
             }
             
-            float r0 = _mm512_reduce_add_ps(sum0);
-            float r1 = _mm512_reduce_add_ps(sum1);
-            float r2 = _mm512_reduce_add_ps(sum2);
-            float r3 = _mm512_reduce_add_ps(sum3);
-            float r4 = _mm512_reduce_add_ps(sum4);
-            float r5 = _mm512_reduce_add_ps(sum5);
-            float r6 = _mm512_reduce_add_ps(sum6);
-            float r7 = _mm512_reduce_add_ps(sum7);
+            y[i] = _mm512_reduce_add_ps(sum0);
+            y[i+1] = _mm512_reduce_add_ps(sum1);
+            y[i+2] = _mm512_reduce_add_ps(sum2);
+            y[i+3] = _mm512_reduce_add_ps(sum3);
+            y[i+4] = _mm512_reduce_add_ps(sum4);
+            y[i+5] = _mm512_reduce_add_ps(sum5);
+            y[i+6] = _mm512_reduce_add_ps(sum6);
+            y[i+7] = _mm512_reduce_add_ps(sum7);
+            y[i+8] = _mm512_reduce_add_ps(sum8);
+            y[i+9] = _mm512_reduce_add_ps(sum9);
+            y[i+10] = _mm512_reduce_add_ps(sum10);
+            y[i+11] = _mm512_reduce_add_ps(sum11);
+            y[i+12] = _mm512_reduce_add_ps(sum12);
+            y[i+13] = _mm512_reduce_add_ps(sum13);
+            y[i+14] = _mm512_reduce_add_ps(sum14);
+            y[i+15] = _mm512_reduce_add_ps(sum15);
             
             for (; j < in_dim; j++) {
                 float xj = x[j];
-                r0 += w0[j] * xj;
-                r1 += w1[j] * xj;
-                r2 += w2[j] * xj;
-                r3 += w3[j] * xj;
-                r4 += w4[j] * xj;
-                r5 += w5[j] * xj;
-                r6 += w6[j] * xj;
-                r7 += w7[j] * xj;
+                y[i] += w0[j] * xj;
+                y[i+1] += w1[j] * xj;
+                y[i+2] += w2[j] * xj;
+                y[i+3] += w3[j] * xj;
+                y[i+4] += w4[j] * xj;
+                y[i+5] += w5[j] * xj;
+                y[i+6] += w6[j] * xj;
+                y[i+7] += w7[j] * xj;
+                y[i+8] += w8[j] * xj;
+                y[i+9] += w9[j] * xj;
+                y[i+10] += w10[j] * xj;
+                y[i+11] += w11[j] * xj;
+                y[i+12] += w12[j] * xj;
+                y[i+13] += w13[j] * xj;
+                y[i+14] += w14[j] * xj;
+                y[i+15] += w15[j] * xj;
             }
-            
-            y[i] = r0; y[i+1] = r1; y[i+2] = r2; y[i+3] = r3;
-            y[i+4] = r4; y[i+5] = r5; y[i+6] = r6; y[i+7] = r7;
         }
         
         for (; i < out_dim; i++) {
@@ -1133,8 +1180,8 @@ struct TransformerBlock {
         float* y_norm = ln2.forward(out);
         float* f = ffn.forward(y_norm, 1);
         
-        // Allocate new output (caller will delete)
-        float* final_out = new float[d_model];
+        // Use preallocated final buffer
+        float* final_out = final_buf;
         i = 0;
         for (; i <= d_model - 16; i += 16) {
             __m512 vo = _mm512_loadu_ps(out + i);
@@ -1166,6 +1213,7 @@ struct GPTMini::Impl {
     mutable bool is_first_call;
     mutable float* last_hidden_states;
     mutable int last_T;
+    mutable float* embed_buf;
 
     Impl(int vocab, int d_model, int n_head, int d_ff, int n_layer, float* embed_weights,
          float* lm_head_weights, const vector<GPTMini::BlockWeights>& block_weights)
@@ -1179,7 +1227,8 @@ struct GPTMini::Impl {
           lm_head(d_model, vocab, lm_head_weights),
           is_first_call(true),
           last_hidden_states(nullptr),
-          last_T(0) {
+          last_T(0),
+          embed_buf(new float[d_model]) {
         blocks.reserve(n_layer);
         for (int i = 0; i < n_layer; i++) {
             const auto& bw = block_weights[i];
@@ -1192,6 +1241,7 @@ struct GPTMini::Impl {
     ~Impl() {
         delete[] embed_W;
         if (last_hidden_states) delete[] last_hidden_states;
+        delete[] embed_buf;
     }
 
     void enable_layer_dumping(const std::string& directory) {
@@ -1222,8 +1272,9 @@ struct GPTMini::Impl {
     }
 
             // Forward through all layers (prefill)
+        // Forward through all layers (prefill)
         for (int layer = 0; layer < n_layer; ++layer) {
-                float* new_x = blocks[layer]->forward_prefill(x, T, d_model);
+            float* new_x = blocks[layer]->forward_prefill(x, T, d_model);
             delete[] x;
             x = new_x;
         }
@@ -1248,21 +1299,20 @@ struct GPTMini::Impl {
             // Incremental: only process the new token
             int new_token = context[T - 1];
             
-            // Embed new token
-            float* x = new float[d_model];
-            for (int i = 0; i < d_model; i++) x[i] = embed_W[new_token * d_model + i];
+            // Embed new token into embed_buf
+            for (int i = 0; i < d_model; i++) embed_buf[i] = embed_W[new_token * d_model + i];
             
             // Forward through all layers (incremental)
+            // Each layer returns its internal buffer, so we don't need to delete
+            float* x = embed_buf;
             for (int layer = 0; layer < n_layer; ++layer) {
-                float* new_x = blocks[layer]->forward_incremental(x);
-                delete[] x;
-                x = new_x;
+                x = blocks[layer]->forward_incremental(x);
             }
             
-            // Update stored hidden states for dump
             float* new_hidden = new float[T * d_model];
             for (int i = 0; i < last_T * d_model; i++) new_hidden[i] = last_hidden_states[i];
             for (int i = 0; i < d_model; i++) new_hidden[last_T * d_model + i] = x[i];
+            
             delete[] last_hidden_states;
             last_hidden_states = new_hidden;
             last_T = T;
@@ -1273,8 +1323,7 @@ struct GPTMini::Impl {
             float* probs = softmax(logits, vocab_size);
             int next = sample_from(probs, vocab_size);
             
-            delete[] x;
-            delete[] logits;
+            // x, logits are internal buffers - don't delete
             delete[] probs;
             return next;
         }
