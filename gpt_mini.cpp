@@ -123,6 +123,9 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
 
     int p = 0;
     for (; p <= k - 8; p += 8) {
+        _mm_prefetch((const char*)(b_ptr + 256), _MM_HINT_T0);
+        _mm_prefetch((const char*)(a_ptr + 256), _MM_HINT_T0);
+
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
@@ -219,7 +222,7 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
     const float* a_ptr = packedA;
 
     int p = 0;
-    for (; p <= k - 8; p += 8) {
+    for (; p <= k - 12; p += 12) {
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
@@ -228,6 +231,10 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
         __m512 b5 = _mm512_load_ps(b_ptr + 80);
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
+        __m512 b8 = _mm512_load_ps(b_ptr + 128);
+        __m512 b9 = _mm512_load_ps(b_ptr + 144);
+        __m512 b10 = _mm512_load_ps(b_ptr + 160);
+        __m512 b11 = _mm512_load_ps(b_ptr + 176);
 
         #define PROCESS_ROW(row) \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row]), b0, c##row); \
@@ -237,7 +244,11 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 64]), b4, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 80]), b5, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 96]), b6, c##row); \
-            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 112]), b7, c##row);
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 112]), b7, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 128]), b8, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 144]), b9, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 160]), b10, c##row); \
+            c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 176]), b11, c##row);
 
         PROCESS_ROW(0) PROCESS_ROW(1) PROCESS_ROW(2) PROCESS_ROW(3)
         PROCESS_ROW(4) PROCESS_ROW(5) PROCESS_ROW(6) PROCESS_ROW(7)
@@ -246,8 +257,8 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
         
         #undef PROCESS_ROW
 
-        b_ptr += 128;
-        a_ptr += 128;
+        b_ptr += 192;
+        a_ptr += 192;
     }
     
     for (; p < k; ++p) {
@@ -291,6 +302,9 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
     _mm512_mask_storeu_ps(C + 15*ldc, mask, c15);
 }
 
+
+
+
 inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
     int indices[16];
@@ -298,7 +312,44 @@ inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, in
     __m512i vindex = _mm512_loadu_si512(indices);
 
     if (i0 + 16 <= i_max) {
-        for (int p = p0; p < p_max; ++p) {
+        int p = p0;
+        for (; p <= p_max - 16; p += 16) {
+            __m512 a0 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p], 4);
+            __m512 a1 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 1], 4);
+            __m512 a2 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 2], 4);
+            __m512 a3 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 3], 4);
+            __m512 a4 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 4], 4);
+            __m512 a5 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 5], 4);
+            __m512 a6 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 6], 4);
+            __m512 a7 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 7], 4);
+            __m512 a8 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 8], 4);
+            __m512 a9 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 9], 4);
+            __m512 a10 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 10], 4);
+            __m512 a11 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 11], 4);
+            __m512 a12 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 12], 4);
+            __m512 a13 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 13], 4);
+            __m512 a14 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 14], 4);
+            __m512 a15 = _mm512_i32gather_ps(vindex, &A[i0 * lda + p + 15], 4);
+            
+            _mm512_store_ps(packed, a0);
+            _mm512_store_ps(packed + 16, a1);
+            _mm512_store_ps(packed + 32, a2);
+            _mm512_store_ps(packed + 48, a3);
+            _mm512_store_ps(packed + 64, a4);
+            _mm512_store_ps(packed + 80, a5);
+            _mm512_store_ps(packed + 96, a6);
+            _mm512_store_ps(packed + 112, a7);
+            _mm512_store_ps(packed + 128, a8);
+            _mm512_store_ps(packed + 144, a9);
+            _mm512_store_ps(packed + 160, a10);
+            _mm512_store_ps(packed + 176, a11);
+            _mm512_store_ps(packed + 192, a12);
+            _mm512_store_ps(packed + 208, a13);
+            _mm512_store_ps(packed + 224, a14);
+            _mm512_store_ps(packed + 240, a15);
+            packed += 256;
+        }
+        for (; p < p_max; ++p) {
             __m512 a = _mm512_i32gather_ps(vindex, &A[i0 * lda + p], 4);
             _mm512_store_ps(packed, a);
             packed += 16;
@@ -406,7 +457,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     static size_t packedA_size = 0;
     static size_t packedB_size = 0;
     
-    size_t needed_A = (size_t)MC * KC;
+    size_t needed_A = (size_t)m_padded * KC;
     size_t needed_B = (size_t)KC * NC;
     
     if (packedA_size < needed_A) {
@@ -423,10 +474,13 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     for (int p0 = 0; p0 < k; p0 += KC) {
         int p_lim = min(k, p0 + KC);
         
+        // Pack entire A strip
+        float* a_pack_ptr = packedA;
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
             int i_lim = min(m_padded, i0 + MC);
             for (int i = i0; i < i_lim; i += MR) {
-                pack_A(k, A, k, i, m, p0, p_lim, &packedA[(i - i0) * (p_lim - p0)]);
+                pack_A(k, A, k, i, m, p0, p_lim, a_pack_ptr);
+                a_pack_ptr += MR * (p_lim - p0);
             }
         }
         
