@@ -12,17 +12,14 @@
 
 #include <immintrin.h>
 
-// 컴파일 단계에서 최고 수준의 최적화를 위해 O3를 적요앟였고 루프 언롤링, 수학 연산 태랩 방지, 자동 벡터화를 활성화 함
 #pragma GCC optimize("O3,unroll-loops,no-trapping-math,tree-vectorize")
 
-// AVX-512 명령어는 512 비트로 정렬된 메모리에 접근 할 떄 가장 효율적이기 떄문에 posix_memalign을 사용해 64바이트로 경계에 맞춰 메모리 할당
 static inline void* alloc_aligned(size_t size) {
     void* ptr;
     if (posix_memalign(&ptr, 64, size)) return nullptr;
     return ptr;
 }
 
-// 할당된 메모리를 해제하는 함수
 static inline void free_aligned(void* ptr) {
     free(ptr);
 }
@@ -34,7 +31,6 @@ using std::vector;
 
 namespace {
 
-// 주어진 확률 분포(p)에서 가장 높은 확률을 가진 인덱스를 반환하는 함수 (Greedy Sampling)
 int sample_from(const float* p, int size) {
     int best_idx = 0;
     float best_val = p[0];
@@ -47,8 +43,8 @@ int sample_from(const float* p, int size) {
     return best_idx;
 }
 
-// SIMD 최적화를 위해 AVX-512 명령어를 통해 16개의 float 데이터를 동시에 처리함
 float* softmax(const float* x, int size) {
+    // Fast max with SIMD
     float maxv = x[0];
     int i = 1;
     if (size >= 16) {
@@ -66,7 +62,8 @@ float* softmax(const float* x, int size) {
         y[i] = std::exp(x[i] - maxv);
         sum += y[i];
     }
-
+    
+    // SIMD normalization
     float inv = 1.0f / sum;
     __m512 vinv = _mm512_set1_ps(inv);
     i = 0;
@@ -77,7 +74,6 @@ float* softmax(const float* x, int size) {
     return y;
 }
 
-// 데이터가 CPU 캐시에 머무르게 하여 캐시 미스를 줄일 수 있도록 하기 위해 큰 행렬을 작은 행렬로 나눠 전치함
 void transpose(const float* __restrict__ M, int rows, int cols, float* __restrict__ T) {
     const int BLOCK = 32;
     for (int i = 0; i < rows; i += BLOCK) {
@@ -93,17 +89,18 @@ void transpose(const float* __restrict__ M, int rows, int cols, float* __restric
     }
 }
 
-// 행렬 M을 전치하여 새로운 행렬 T를 생성하고 반환하는 함수 (메모리 할당 포함)
 float* transpose(const float* M, int rows, int cols) {
     float* T = new float[cols * rows];
     transpose(M, rows, cols, T);
     return T;
 }
 
-// 자주 호출되는 함수를 인라인화하여 함수 호출 오버헤드를 제거함
-// 결과 행렬의 16x16 블록을 16개의 AVX-512 레지스터에 로드하여 유지함 -> 메모리 접근을 최소화하고 레지스터를 최대한 활용하게 하기 위함
+// ==================== Optimized Matrix Multiplication ====================
+
 __attribute__((always_inline, hot))
-inline void kernel_16x16(int k, const float* __restrict__ packedA, const float* __restrict__ packedB, float* __restrict__ C, int ldc) {
+inline void kernel_16x16(int k, const float* __restrict__ packedA, 
+                         const float* __restrict__ packedB, 
+                         float* __restrict__ C, int ldc) {
     __m512 c0  = _mm512_loadu_ps(C + 0*ldc);
     __m512 c1  = _mm512_loadu_ps(C + 1*ldc);
     __m512 c2  = _mm512_loadu_ps(C + 2*ldc);
@@ -126,7 +123,6 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA, const float* 
 
     int p = 0;
     for (; p <= k - 8; p += 8) {
-        // 다음에 사용할 메모리를 미리 가져와서 메모리 로드 시간 절약
         _mm_prefetch((const char*)(b_ptr + 256), _MM_HINT_T0);
         _mm_prefetch((const char*)(a_ptr + 256), _MM_HINT_T0);
 
@@ -139,8 +135,6 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA, const float* 
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
 
-        // PROCESS_ROW 매크로를 사용하여 루프를 수동으로 풀어 분기 예측 실패를 줄임
-        // _mm512_fmadd_ps를 사용하여 곱셈과 덧셈을 하나의 명령어로 처리
         #define PROCESS_ROW(row) \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row]), b0, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 16]), b1, c##row); \
@@ -203,10 +197,10 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA, const float* 
     _mm512_storeu_ps(C + 15*ldc, c15);
 }
 
-// 마스킹을 지원하는 16x16 블록 행렬 곱셈 커널
-// 경계 처리 등으로 인해 16의 배수가 아닌 경우 마스크를 사용하여 유효한 부분만 연산
 __attribute__((always_inline, hot))
-inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, const float* __restrict__ packedB, float* __restrict__ C, int ldc, __mmask16 mask) {
+inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, 
+                                const float* __restrict__ packedB, 
+                                float* __restrict__ C, int ldc, __mmask16 mask) {
     __m512 c0  = _mm512_maskz_loadu_ps(mask, C + 0*ldc);
     __m512 c1  = _mm512_maskz_loadu_ps(mask, C + 1*ldc);
     __m512 c2  = _mm512_maskz_loadu_ps(mask, C + 2*ldc);
@@ -308,7 +302,9 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, const 
     _mm512_mask_storeu_ps(C + 15*ldc, mask, c15);
 }
 
-// 행렬 곱셈 시 메모리 접근 패턴을 연속적으로 만들기 위해 데이터를 재배열함 -> TLB 미스를 줄이고 캐시 효율 극대화
+
+
+
 inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
     int indices[16];
@@ -368,7 +364,6 @@ inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, in
     }
 }
 
-// 행렬 B의 일부 블록을 패킹하여 연속된 메모리에 저장하는 함수
 inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max, int nr, float* packed) {
     (void)k;
     if (nr == 16 && j0 + 16 <= j_max) {
@@ -390,7 +385,6 @@ inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, in
     }
 }
 
-// 두 벡터 A와 B의 내적(Dot Product)을 계산하는 함수
 inline float dot_product(const float* A, const float* B, int k) {
     __m512 sum0 = _mm512_setzero_ps();
     __m512 sum1 = _mm512_setzero_ps();
@@ -418,7 +412,6 @@ inline float dot_product(const float* A, const float* B, int k) {
     return res;
 }
 
-// 벡터 src에 스칼라 값 scale을 곱하여 dst에 저장하는 함수
 inline void scale_vector(const float* src, float scale, int n, float* dst) {
     __m512 s = _mm512_set1_ps(scale);
     int j = 0;
@@ -436,15 +429,12 @@ inline void scale_vector(const float* src, float scale, int n, float* dst) {
     }
 }
 
-// 레지스터 블로킹 사이즈와 캐시 블로킹 사이즈를 설정하여 데이터 재사용성을 높이고 메인 메모리 대역폭 사용을 줄임
 static constexpr int MR = 16;
 static constexpr int NR = 16;
 static constexpr int MC = 256;
 static constexpr int KC = 256;
 static constexpr int NC = 256;
 
-// 일반적인 행렬 곱셈 함수 (GEMM: C = A * B)
-// 블로킹과 패킹을 사용하여 최적화된 행렬 곱셈을 수행
 float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int n) {
     if (m == 1 && n == 1) {
         float* C = new float[1];
@@ -484,6 +474,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     for (int p0 = 0; p0 < k; p0 += KC) {
         int p_lim = min(k, p0 + KC);
         
+        // Pack entire A strip
         float* a_pack_ptr = packedA;
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
             int i_lim = min(m_padded, i0 + MC);
@@ -534,7 +525,6 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
     return C;
 }
 
-// 배치 사이즈가 1인 경우에 특화된 커널을 만들어 불필요한 연산을 감소시킴
 inline void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
     __m512 c0 = _mm512_loadu_ps(C);
     __m512 c1 = _mm512_setzero_ps();
@@ -564,7 +554,6 @@ inline void kernel_16x1(int k, const float* packedA, const float* B, float* C) {
     _mm512_storeu_ps(C, c);
 }
 
-// 이미 패킹된 행렬을 재사용하여 패킹 비용을 절약
 void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const float* B, int n, float* C) {
     int m_padded = (m + MR - 1) & ~(MR - 1);
     std::fill(C, C + m_padded * n, 0.0f);
@@ -647,8 +636,6 @@ void matrix_matrix_multiply_prepacked(const float* packedA, int m, int k, const 
     }
 }
 
-// 전체 행렬 A를 미리 패킹하여 반환하는 함수
-// 가중치 행렬과 같이 고정된 행렬을 미리 처리해두기 위해 사용
 float* pack_matrix_A(int m, int k, const float* A) {
     int m_padded = (m + MR - 1) & ~(MR - 1);
 
@@ -678,12 +665,14 @@ float* pack_matrix_A(int m, int k, const float* A) {
     return packed;
 }
 
+// ==================== Neural Network Layers ====================
+
+
 struct Linear {
     int in_dim;
     int out_dim;
     float* W;
-    float* WT;
-    // 가중치 행렬 W를 미리 전치하고 피킹함 -> 추론 시 매번 변환해야 하는 비용 감소
+    float* WT;  // Transposed weights for GEMV
     float* packedW;
     mutable std::vector<float> workspace;
     mutable float* gemv_output;
@@ -691,20 +680,22 @@ struct Linear {
     Linear(const Linear&) = delete;
     Linear& operator=(const Linear&) = delete;
 
-    Linear& operator=(const Linear&) = delete;
-    
-    // Linear 레이어 생성자: 가중치 초기화 및 최적화를 위한 전처리(전치, 패킹) 수행
     Linear(int in_dim, int out_dim, float* weights)
         : in_dim(in_dim), out_dim(out_dim) {
+        // Create copy of weights
         W = new float[in_dim * out_dim];
         size_t size = (size_t)in_dim * out_dim;
         for (size_t i = 0; i < size; ++i) W[i] = weights[i];
-
+        
+        // Create transposed weights for fast GEMV
         WT = new float[in_dim * out_dim];
         transpose(W, out_dim, in_dim, WT);
         
         packedW = pack_matrix_A(out_dim, in_dim, W);
         gemv_output = new float[out_dim];
+        // fprintf(stderr, "Linear %p constructed, gemv_output %p\n", (void*)this, (void*)gemv_output);
+        
+        // Delete original weights as we own them now
         delete[] weights;
     }
 
@@ -714,10 +705,12 @@ struct Linear {
         free_aligned(packedW);
     }
 
-    // 배치 사이즈가 1인 경우, 무거운 GEMM 알고리즘 대신 가벼운 GEMV 알고리즘을 사용하여 오버헤드를 줄임
+    // Optimized GEMV: y = W @ x where W is [out_dim, in_dim], x is [in_dim]
     float* forward_gemv(const float* x) const {
         float* y = new float[out_dim];
-
+        // fprintf(stderr, "Linear %p forward_gemv, gemv_output %p\n", (void*)this, (void*)y);
+        
+        // Process 16 output elements at a time for better ILP
         int i = 0;
         for (; i <= out_dim - 16; i += 16) {
             __m512 sum0 = _mm512_setzero_ps();
@@ -829,9 +822,6 @@ struct Linear {
         return y;
     }
 
-    }
-    
-    // 일반적인 순전파 함수 (배치 크기에 따라 GEMV 또는 GEMM 선택)
     float* forward(const float* x, int batch_size) const {
         if (batch_size == 1) {
             return forward_gemv(x);
@@ -851,22 +841,16 @@ struct Linear {
     }
 };
 
-// LayerNorm 레이어 구조체: 층 정규화를 수행
 struct LayerNorm {
     int dim;
     mutable float* buf;
 
-    mutable float* buf;
-    
-    // LayerNorm 생성자: 차원 설정 및 버퍼 할당
     explicit LayerNorm(int dim) : dim(dim), buf(new float[dim]) {}
 
-    // 소멸자: 할당된 메모리 해제
     ~LayerNorm() { delete[] buf; }
 
-    // 층 정규화(Layer Normalization)를 수행하는 순전파 함수
     float* forward(const float* x) const {
-        // 평균과 분산 계산은 AVX-512를 사용하여 병렬 처리
+        // Single pass: compute sum and sum of squares
         __m512 vsum = _mm512_setzero_ps();
         __m512 vsum2 = _mm512_setzero_ps();
         int i = 0;
@@ -908,9 +892,6 @@ struct FeedForward {
     mutable float* buffer;
     mutable int buffer_size;
 
-    mutable int buffer_size;
-    
-    // FeedForward 생성자: 두 개의 Linear 레이어 초기화
     FeedForward(int d_model, int d_ff, float* fc1_weights, float* fc2_weights)
         : fc1(d_model, d_ff, fc1_weights), fc2(d_ff, d_model, fc2_weights),
           buffer(nullptr), buffer_size(0) {}
@@ -918,11 +899,11 @@ struct FeedForward {
     ~FeedForward() {
         if (buffer) delete[] buffer;
     }
-    
-    // 피드포워드 신경망의 순전파 함수 (Linear -> ReLU -> Linear)
+
     float* forward(const float* x, int batch_size) {
         float* h = fc1.forward(x, batch_size);
-        // _mm512_max_ps를 사용하여 16개 요소에 대해 동시에 ReLU를 적용
+        
+        // Fused ReLU - modify in place
         int size = batch_size * fc1.out_dim;
         __m512 zero = _mm512_setzero_ps();
         int i = 0;
@@ -940,29 +921,26 @@ struct FeedForward {
     }
 };
 
+// SelfAttention with KV caching for incremental generation
 struct SelfAttention {
     int d_model;
     Linear q_proj;
     Linear k_proj;
     Linear v_proj;
     Linear o_proj;
-
-    // 이전 토큰들의 Key, Value 값을 캐싱하여 중복 계산을 방지함
-    // 스탭마다 전체를 다시 계산하지 않고 새로운 토큰에 대해서만 계산
+    
+    // KV cache
     mutable float* k_cache;
     mutable float* v_cache;
     mutable int cache_len;
     mutable int cache_capacity;
     
+    // Preallocated buffers for incremental forward
     mutable float* scores_buf;
     mutable float* out_buf;
     mutable int scores_capacity;
     float scale;
 
-    mutable int scores_capacity;
-    float scale;
-    
-    // SelfAttention 생성자: Q, K, V, O 프로젝션 레이어 초기화
     SelfAttention(int d_model, [[maybe_unused]] int n_head_unused, float* Wq_weights, float* Wk_weights,
                   float* Wv_weights, float* Wo_weights)
         : d_model(d_model),
@@ -987,15 +965,10 @@ struct SelfAttention {
         if (out_buf) delete[] out_buf;
     }
     
-        if (out_buf) delete[] out_buf;
-    }
-    
-    // KV 캐시를 초기화하는 함수 (새로운 문장 생성 시작 시 호출)
     void reset_cache() {
         cache_len = 0;
     }
     
-    // KV 캐시 및 중간 버퍼의 용량을 확보하는 함수
     void ensure_cache_capacity(int new_len) const {
         if (new_len > cache_capacity) {
             int new_cap = max(64, new_len * 2);
@@ -1020,12 +993,13 @@ struct SelfAttention {
         }
     }
 
-    // 문맥 전체에 대해 병렬로 어텐션을 계산
+    // Full forward for prefill (processes all tokens)
     float* forward_prefill(const float* x, int T) {
         float* Q = q_proj.forward(x, T);
         float* K = k_proj.forward(x, T);
         float* V = v_proj.forward(x, T);
         
+        // Store K, V in cache
         ensure_cache_capacity(T);
         for (int i = 0; i < T * d_model; i++) {
             k_cache[i] = K[i];
@@ -1056,9 +1030,10 @@ struct SelfAttention {
 
         float* out_proj = o_proj.forward(out, T);
         delete[] out;
-        }
+        return out_proj;
+    }
     
-    // 새로운 토큰 하나에 대해서만 어텐션 연산을 수행하고 이전 KV 캐시를 활용하여 중복 계산을 줄임
+    // Incremental forward (processes only the last token) - highly optimized
     float* forward_incremental(const float* x) {
         float* q = q_proj.forward(x, 1);
         float* k = k_proj.forward(x, 1);
@@ -1066,7 +1041,8 @@ struct SelfAttention {
         
         int new_pos = cache_len;
         ensure_cache_capacity(cache_len + 1);
-
+        
+        // SIMD copy to cache
         int i = 0;
         for (; i <= d_model - 16; i += 16) {
             _mm512_storeu_ps(k_cache + new_pos * d_model + i, _mm512_loadu_ps(k + i));
@@ -1080,7 +1056,8 @@ struct SelfAttention {
         
         delete[] k;
         delete[] v;
-
+        
+        // Use preallocated scores buffer
         float* scores = scores_buf;
         
         for (int j = 0; j < cache_len; j++) {
@@ -1101,6 +1078,7 @@ struct SelfAttention {
             scores[j] = dot * scale;
         }
         
+        // Fast softmax
         float maxv = scores[0];
         for (int j = 1; j < cache_len; j++) if (scores[j] > maxv) maxv = scores[j];
         
@@ -1112,8 +1090,10 @@ struct SelfAttention {
         float inv_sum = 1.0f / sum;
         for (int j = 0; j < cache_len; j++) scores[j] *= inv_sum;
         
+        // Use preallocated output buffer
         float* out = out_buf;
-
+        
+        // Initialize output with first weighted V
         {
             __m512 va = _mm512_set1_ps(scores[0]);
             const float* v0 = v_cache;
@@ -1129,7 +1109,8 @@ struct SelfAttention {
             }
             for (; p < d_model; p++) out[p] = scores[0] * v0[p];
         }
-
+        
+        // Add remaining weighted Vs
         for (int j = 1; j < cache_len; j++) {
             __m512 va = _mm512_set1_ps(scores[j]);
             const float* vj = v_cache + j * d_model;
@@ -1164,14 +1145,11 @@ struct TransformerBlock {
     LayerNorm ln1;
     LayerNorm ln2;
     int d_model;
-
-    mutable float* out_buf;
-    mutable float* final_buf;
-
-    mutable float* out_buf;
-    mutable float* final_buf;
     
-    // TransformerBlock 생성자: 어텐션, 피드포워드, 정규화 레이어 초기화
+    // Preallocated buffers for incremental forward
+    mutable float* out_buf;
+    mutable float* final_buf;
+
     TransformerBlock(int d_model, int n_head, int d_ff, float* Wq_weights, float* Wk_weights,
                      float* Wv_weights, float* Wo_weights, float* fc1_weights, float* fc2_weights)
         : attn(d_model, n_head, Wq_weights, Wk_weights, Wv_weights, Wo_weights),
@@ -1188,12 +1166,11 @@ struct TransformerBlock {
         delete[] final_buf;
     }
     
-    // 블록 내의 어텐션 캐시를 초기화하는 함수
     void reset_cache() {
         attn.reset_cache();
     }
-    
-    // Transformer 블록의 Prefill 단계 순전파 함수 (LayerNorm -> Attention -> Residual -> LayerNorm -> FFN -> Residual)
+
+    // Prefill: process all tokens
     float* forward_prefill(const float* x, int T, int d_model) {
         float* x_norm = new float[T * d_model];
         for (int t = 0; t < T; t++) {
@@ -1238,13 +1215,12 @@ struct TransformerBlock {
         return final_out;
     }
     
-        return final_out;
-    }
-    
-    // Transformer 블록의 Incremental Decoding 단계 순전파 함수
+    // Incremental: process only the last token
     float* forward_incremental(const float* x) {
         float* x_norm = ln1.forward(x);
         float* attn_out = attn.forward_incremental(x_norm);
+
+        // Use preallocated buffer for intermediate result
         float* out = out_buf;
         int i = 0;
         for (; i <= d_model - 16; i += 16) {
@@ -1257,7 +1233,8 @@ struct TransformerBlock {
 
         float* y_norm = ln2.forward(out);
         float* f = ffn.forward(y_norm, 1);
-
+        
+        // Use preallocated final buffer
         float* final_out = final_buf;
         i = 0;
         for (; i <= d_model - 16; i += 16) {
@@ -1266,12 +1243,13 @@ struct TransformerBlock {
             _mm512_storeu_ps(final_out + i, _mm512_add_ps(vo, vf));
         }
         for (; i < d_model; i++) final_out[i] = out[i] + f[i];
+        
         delete[] f;
         return final_out;
     }
 };
 
-}
+}  // namespace
 
 struct GPTMini::Impl {
     int vocab_size;
@@ -1284,16 +1262,13 @@ struct GPTMini::Impl {
     Linear lm_head;
     bool dump_enabled = false;
     std::string dump_dir;
-
+    
+    // For KV caching
     mutable bool is_first_call;
     mutable float* last_hidden_states;
     mutable int last_T;
     mutable float* embed_buf;
 
-    mutable int last_T;
-    mutable float* embed_buf;
-    
-    // GPTMini 구현체 생성자: 모델 파라미터 및 레이어 초기화
     Impl(int vocab, int d_model, int n_head, int d_ff, int n_layer, float* embed_weights,
          float* lm_head_weights, const vector<GPTMini::BlockWeights>& block_weights)
         : vocab_size(vocab),
@@ -1311,7 +1286,9 @@ struct GPTMini::Impl {
         blocks.reserve(n_layer);
         for (int i = 0; i < n_layer; i++) {
             const auto& bw = block_weights[i];
-            blocks.emplace_back(std::make_unique<TransformerBlock>(d_model, n_head, d_ff, bw.Wq, bw.Wk, bw.Wv, bw.Wo, bw.fc1, bw.fc2));
+            blocks.emplace_back(std::make_unique<TransformerBlock>(d_model, n_head, d_ff, bw.Wq,
+                                                                   bw.Wk, bw.Wv, bw.Wo, bw.fc1,
+                                                                   bw.fc2));
         }
     }
 
@@ -1321,34 +1298,35 @@ struct GPTMini::Impl {
         delete[] embed_buf;
     }
 
-    // 디버깅을 위한 레이어 출력 덤프 활성화 함수
     void enable_layer_dumping(const std::string& directory) {
         utils::enable_layer_dumping(dump_enabled, dump_dir, directory);
     }
-    
-    // 특정 레이어의 출력을 파일로 저장하는 함수
+
     void dump_layer_output(const float* data, int rows, int cols) {
         utils::dump_layer_output(dump_enabled, dump_dir, data, rows, cols);
     }
-    
-    // 주어진 문맥(context)을 바탕으로 다음 토큰을 생성하는 함수 (전체 모델 파이프라인 제어)
+
     int generate_next(const vector<int>& context) {
         int T = context.size();
         
-        // 첫 호출이거나 문맥이 짧을 경우 전체를 계산하고 이후에는 KV 캐시를 활용한 증분 디코딩을 수행하게 함
         if (is_first_call || T <= 3) {
+            // First call or context reset: do full prefill
             is_first_call = false;
-
+            
+            // Reset caches
             for (int layer = 0; layer < n_layer; ++layer) {
                 blocks[layer]->reset_cache();
             }
-
+            
+            // Embed all tokens
         float* x = new float[T * d_model];
         for (int t = 0; t < T; t++) {
                 int id = context[t];
             for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed_W[id * d_model + i];
     }
 
+            // Forward through all layers (prefill)
+        // Forward through all layers (prefill)
         for (int layer = 0; layer < n_layer; ++layer) {
             float* new_x = blocks[layer]->forward_prefill(x, T, d_model);
             delete[] x;
@@ -1356,6 +1334,8 @@ struct GPTMini::Impl {
         }
             
         dump_layer_output(x, T, d_model);
+            
+            // Store for incremental generation
             if (last_hidden_states) delete[] last_hidden_states;
             last_hidden_states = new float[T * d_model];
             for (int i = 0; i < T * d_model; i++) last_hidden_states[i] = x[i];
@@ -1370,10 +1350,14 @@ struct GPTMini::Impl {
             delete[] probs;
             return next;
         } else {
+            // Incremental: only process the new token
             int new_token = context[T - 1];
             
+            // Embed new token into embed_buf
             for (int i = 0; i < d_model; i++) embed_buf[i] = embed_W[new_token * d_model + i];
             
+            // Forward through all layers (incremental)
+            // Each layer returns its internal buffer, so we don't need to delete
             float* x = embed_buf;
             for (int layer = 0; layer < n_layer; ++layer) {
                 x = blocks[layer]->forward_incremental(x);
@@ -1393,13 +1377,13 @@ struct GPTMini::Impl {
             float* probs = softmax(logits, vocab_size);
             int next = sample_from(probs, vocab_size);
             
+            // x, logits are internal buffers - don't delete
             delete[] probs;
             return next;
         }
     }
 };
 
-// GPTMini 생성자 (Pimpl 패턴 사용)
 GPTMini::GPTMini(int vocab, int d_model, int n_head, int d_ff, int n_layer,
                  float* embed_weights, float* lm_head_weights,
                  const vector<BlockWeights>& block_weights)
@@ -1408,10 +1392,8 @@ GPTMini::GPTMini(int vocab, int d_model, int n_head, int d_ff, int n_layer,
 
 GPTMini::~GPTMini() { delete impl; }
 
-// 다음 토큰 생성을 요청하는 인터페이스 함수
 int GPTMini::generate_next(const vector<int>& context) { return impl->generate_next(context); }
 
-// 레이어 덤프 기능을 활성화하는 인터페이스 함수
 void GPTMini::enable_layer_dumping(const std::string& directory) {
     impl->enable_layer_dumping(directory);
 }
