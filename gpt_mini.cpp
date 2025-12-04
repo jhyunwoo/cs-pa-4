@@ -12,8 +12,10 @@
 
 #include <immintrin.h>
 
+// 컴파일러에서 최대한의 최적화를 달성하기 위해 컴퍼일러 옵션을 지정함
 #pragma GCC optimize("O3,unroll-loops,no-trapping-math,tree-vectorize")
 
+// 메모리 정렬 과정에서 AVX-512와 같은 SIMD 명령어는 데이터가 64바이트 경계에 정렬되어 있을 때 가장 빠르게 데이터를 로드하고 저장할 수 있기 때문에 64바이트로 메모리 정렬함
 static inline void* alloc_aligned(size_t size) {
     void* ptr;
     if (posix_memalign(&ptr, 64, size)) return nullptr;
@@ -31,6 +33,7 @@ using std::vector;
 
 namespace {
 
+// 확률 분포에서 가장 높은 확률을 가진 인덱스 선택
 int sample_from(const float* p, int size) {
     int best_idx = 0;
     float best_val = p[0];
@@ -43,28 +46,35 @@ int sample_from(const float* p, int size) {
     return best_idx;
 }
 
+// Softmax 연산을 AVX-512로 병렬화함
 float* softmax(const float* x, int size) {
     float maxv = x[0];
     int i = 1;
+    // 데이터 사이즈가 16이상일 경우 SIMD 병렬 처리
     if (size >= 16) {
+        // 16개의 데이터를 한 번에 로드하여 병렬로 MAX 값을 찾음
         __m512 vmax = _mm512_loadu_ps(x);
         for (i = 16; i <= size - 16; i += 16) {
             vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(x + i));
         }
+        // 레지스터 내의 값들을 수평적으로 비교하여 최종 최대 값을 찾음
         maxv = _mm512_reduce_max_ps(vmax);
     }
     for (; i < size; i++) if (x[i] > maxv) maxv = x[i];
     
     float* y = new float[size];
     float sum = 0;
+    // Exp 연산 및 합계 계산
     for (i = 0; i < size; i++) {
         y[i] = std::exp(x[i] - maxv);
         sum += y[i];
     }
     
+    // 나눗셈은 곱셈보다 훨씬 느리기 때문에 역수를 구해서 곱셈으로 처리
     float inv = 1.0f / sum;
     __m512 vinv = _mm512_set1_ps(inv);
     i = 0;
+    // 정규화 과정 병렬화
     for (; i <= size - 16; i += 16) {
         _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(y + i), vinv));
     }
@@ -72,8 +82,9 @@ float* softmax(const float* x, int size) {
     return y;
 }
 
+
 void transpose(const float* __restrict__ M, int rows, int cols, float* __restrict__ T) {
-    const int BLOCK = 32;
+    const int BLOCK = 32; // 캐시 라인 활용을 위한 블록 사이즈
     for (int i = 0; i < rows; i += BLOCK) {
         for (int j = 0; j < cols; j += BLOCK) {
             int i_lim = min(rows, i + BLOCK);
@@ -93,22 +104,21 @@ float* transpose(const float* M, int rows, int cols) {
     return T;
 }
 
-// ==================== Optimized Matrix Multiplication ====================
-
-__attribute__((always_inline, hot))
-inline void kernel_16x16(int k, const float* __restrict__ packedA, 
-                         const float* __restrict__ packedB, 
-                         float* __restrict__ C, int ldc) {
-    __m512 c0  = _mm512_loadu_ps(C + 0*ldc);
-    __m512 c1  = _mm512_loadu_ps(C + 1*ldc);
-    __m512 c2  = _mm512_loadu_ps(C + 2*ldc);
-    __m512 c3  = _mm512_loadu_ps(C + 3*ldc);
-    __m512 c4  = _mm512_loadu_ps(C + 4*ldc);
-    __m512 c5  = _mm512_loadu_ps(C + 5*ldc);
-    __m512 c6  = _mm512_loadu_ps(C + 6*ldc);
-    __m512 c7  = _mm512_loadu_ps(C + 7*ldc);
-    __m512 c8  = _mm512_loadu_ps(C + 8*ldc);
-    __m512 c9  = _mm512_loadu_ps(C + 9*ldc);
+// CPU 레지스터를 캐시로 사용하기 위해 16 x 16 크기의 결과 행렬 C의 일부분을 레지스터에 상주시키고 연산을 수행함
+__attribute__((always_inline, hot)) // 매우 자주 호출되므로 반드시 인라인 처리하고 최적화 우선순위를 높임
+inline void kernel_16x16(int k, const float* __restrict__ packedA, const float* __restrict__ packedB, float* __restrict__ C, int ldc) {
+    // 결과값 C의 16x16 블록을 16개의 ZMM 레지스터에 로드
+    // 각 레지스터는 16개의 float를 담음
+    __m512 c0 = _mm512_loadu_ps(C + 0*ldc);
+    __m512 c1 = _mm512_loadu_ps(C + 1*ldc);
+    __m512 c2 = _mm512_loadu_ps(C + 2*ldc);
+    __m512 c3 = _mm512_loadu_ps(C + 3*ldc);
+    __m512 c4 = _mm512_loadu_ps(C + 4*ldc);
+    __m512 c5 = _mm512_loadu_ps(C + 5*ldc);
+    __m512 c6 = _mm512_loadu_ps(C + 6*ldc);
+    __m512 c7 = _mm512_loadu_ps(C + 7*ldc);
+    __m512 c8 = _mm512_loadu_ps(C + 8*ldc);
+    __m512 c9 = _mm512_loadu_ps(C + 9*ldc);
     __m512 c10 = _mm512_loadu_ps(C + 10*ldc);
     __m512 c11 = _mm512_loadu_ps(C + 11*ldc);
     __m512 c12 = _mm512_loadu_ps(C + 12*ldc);
@@ -120,10 +130,15 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
     const float* a_ptr = packedA;
 
     int p = 0;
-    for (; p <= k - 8; p += 8) {
+    for (; p <= k - 8; p += 8) { // 루프 제어 오버헤드를 줄이기 위해 8번씩 묶어서 처리
+        // 프리패칭 적용
+        // 다음 반복에서 사용할 데이터를 미리 L1 캐시로 가져오라고 명령
+        // 프리패칭을 통해 메모리 대기 시간을 연산 시간 뒤로 숨김
         _mm_prefetch((const char*)(b_ptr + 256), _MM_HINT_T0);
         _mm_prefetch((const char*)(a_ptr + 256), _MM_HINT_T0);
-
+        
+        // Rank-1 Update 연산 방식
+        // 브로드캐스트와 FMA 사용
         __m512 b0 = _mm512_load_ps(b_ptr);
         __m512 b1 = _mm512_load_ps(b_ptr + 16);
         __m512 b2 = _mm512_load_ps(b_ptr + 32);
@@ -133,6 +148,7 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
         __m512 b6 = _mm512_load_ps(b_ptr + 96);
         __m512 b7 = _mm512_load_ps(b_ptr + 112);
 
+        // A의 값 하나를 벡터 전체로 복사한 뒤 b0과 곱하고 c0에 더함
         #define PROCESS_ROW(row) \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row]), b0, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 16]), b1, c##row); \
@@ -143,31 +159,47 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 96]), b6, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 112]), b7, c##row);
 
-        PROCESS_ROW(0) PROCESS_ROW(1) PROCESS_ROW(2) PROCESS_ROW(3)
-        PROCESS_ROW(4) PROCESS_ROW(5) PROCESS_ROW(6) PROCESS_ROW(7)
-        PROCESS_ROW(8) PROCESS_ROW(9) PROCESS_ROW(10) PROCESS_ROW(11)
-        PROCESS_ROW(12) PROCESS_ROW(13) PROCESS_ROW(14) PROCESS_ROW(15)
+        // 매크로를 사용하여 16개 행에 대해 연산 수행
+        PROCESS_ROW(0)
+        PROCESS_ROW(1)
+        PROCESS_ROW(2)
+        PROCESS_ROW(3)
+        PROCESS_ROW(4)
+        PROCESS_ROW(5)
+        PROCESS_ROW(6)
+        PROCESS_ROW(7)
+        PROCESS_ROW(8)
+        PROCESS_ROW(9)
+        PROCESS_ROW(10)
+        PROCESS_ROW(11)
+        PROCESS_ROW(12)
+        PROCESS_ROW(13)
+        PROCESS_ROW(14)
+        PROCESS_ROW(15)
         
         #undef PROCESS_ROW
 
+        // 포인터 이동
         b_ptr += 128;
         a_ptr += 128;
     }
     
+    // 남은 K 차원 처리 루프
     for (; p < k; ++p) {
         __m512 b = _mm512_load_ps(b_ptr);
         b_ptr += 16;
         
-        c0  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
-        c1  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
-        c2  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
-        c3  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
-        c4  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
-        c5  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
-        c6  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
-        c7  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
-        c8  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
-        c9  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
+        // 각 행마다 FMA 연산 수행
+        c0 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
+        c1 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
+        c2 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
+        c3 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
+        c4 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
+        c5 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
+        c6 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
+        c7 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
+        c8 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
+        c9 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
         c10 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[10]), b, c10);
         c11 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[11]), b, c11);
         c12 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[12]), b, c12);
@@ -177,6 +209,7 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
         a_ptr += 16;
     }
 
+    // 레지스터에 누적된 결과를 다시 메모리로 저장
     _mm512_storeu_ps(C + 0*ldc, c0);
     _mm512_storeu_ps(C + 1*ldc, c1);
     _mm512_storeu_ps(C + 2*ldc, c2);
@@ -195,20 +228,20 @@ inline void kernel_16x16(int k, const float* __restrict__ packedA,
     _mm512_storeu_ps(C + 15*ldc, c15);
 }
 
+// 행렬 크기가 16의 배수가 아닐 때를 처리하기 위한 커널
 __attribute__((always_inline, hot))
-inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, 
-                                const float* __restrict__ packedB, 
-                                float* __restrict__ C, int ldc, __mmask16 mask) {
-    __m512 c0  = _mm512_maskz_loadu_ps(mask, C + 0*ldc);
-    __m512 c1  = _mm512_maskz_loadu_ps(mask, C + 1*ldc);
-    __m512 c2  = _mm512_maskz_loadu_ps(mask, C + 2*ldc);
-    __m512 c3  = _mm512_maskz_loadu_ps(mask, C + 3*ldc);
-    __m512 c4  = _mm512_maskz_loadu_ps(mask, C + 4*ldc);
-    __m512 c5  = _mm512_maskz_loadu_ps(mask, C + 5*ldc);
-    __m512 c6  = _mm512_maskz_loadu_ps(mask, C + 6*ldc);
-    __m512 c7  = _mm512_maskz_loadu_ps(mask, C + 7*ldc);
-    __m512 c8  = _mm512_maskz_loadu_ps(mask, C + 8*ldc);
-    __m512 c9  = _mm512_maskz_loadu_ps(mask, C + 9*ldc);
+inline void kernel_16x16_masked(int k, const float* __restrict__ packedA, const float* __restrict__ packedB, float* __restrict__ C, int ldc, __mmask16 mask) {
+    // Mask를 적용하여 유효한 데이터만 로드
+    __m512 c0 = _mm512_maskz_loadu_ps(mask, C + 0*ldc);
+    __m512 c1 = _mm512_maskz_loadu_ps(mask, C + 1*ldc);
+    __m512 c2 = _mm512_maskz_loadu_ps(mask, C + 2*ldc);
+    __m512 c3 = _mm512_maskz_loadu_ps(mask, C + 3*ldc);
+    __m512 c4 = _mm512_maskz_loadu_ps(mask, C + 4*ldc);
+    __m512 c5 = _mm512_maskz_loadu_ps(mask, C + 5*ldc);
+    __m512 c6 = _mm512_maskz_loadu_ps(mask, C + 6*ldc);
+    __m512 c7 = _mm512_maskz_loadu_ps(mask, C + 7*ldc);
+    __m512 c8 = _mm512_maskz_loadu_ps(mask, C + 8*ldc);
+    __m512 c9 = _mm512_maskz_loadu_ps(mask, C + 9*ldc);
     __m512 c10 = _mm512_maskz_loadu_ps(mask, C + 10*ldc);
     __m512 c11 = _mm512_maskz_loadu_ps(mask, C + 11*ldc);
     __m512 c12 = _mm512_maskz_loadu_ps(mask, C + 12*ldc);
@@ -248,10 +281,22 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 160]), b10, c##row); \
             c##row = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[row + 176]), b11, c##row);
 
-        PROCESS_ROW(0) PROCESS_ROW(1) PROCESS_ROW(2) PROCESS_ROW(3)
-        PROCESS_ROW(4) PROCESS_ROW(5) PROCESS_ROW(6) PROCESS_ROW(7)
-        PROCESS_ROW(8) PROCESS_ROW(9) PROCESS_ROW(10) PROCESS_ROW(11)
-        PROCESS_ROW(12) PROCESS_ROW(13) PROCESS_ROW(14) PROCESS_ROW(15)
+        PROCESS_ROW(0)
+        PROCESS_ROW(1)
+        PROCESS_ROW(2)
+        PROCESS_ROW(3)
+        PROCESS_ROW(4)
+        PROCESS_ROW(5)
+        PROCESS_ROW(6)
+        PROCESS_ROW(7)
+        PROCESS_ROW(8)
+        PROCESS_ROW(9)
+        PROCESS_ROW(10)
+        PROCESS_ROW(11)
+        PROCESS_ROW(12)
+        PROCESS_ROW(13)
+        PROCESS_ROW(14)
+        PROCESS_ROW(15)
         
         #undef PROCESS_ROW
 
@@ -263,16 +308,16 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
         __m512 b = _mm512_load_ps(b_ptr);
         b_ptr += 16;
         
-        c0  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
-        c1  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
-        c2  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
-        c3  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
-        c4  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
-        c5  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
-        c6  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
-        c7  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
-        c8  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
-        c9  = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
+        c0 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[0]), b, c0);
+        c1 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[1]), b, c1);
+        c2 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[2]), b, c2);
+        c3 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[3]), b, c3);
+        c4 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[4]), b, c4);
+        c5 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[5]), b, c5);
+        c6 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[6]), b, c6);
+        c7 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[7]), b, c7);
+        c8 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[8]), b, c8);
+        c9 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[9]), b, c9);
         c10 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[10]), b, c10);
         c11 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[11]), b, c11);
         c12 = _mm512_fmadd_ps(_mm512_set1_ps(a_ptr[12]), b, c12);
@@ -282,6 +327,7 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
         a_ptr += 16;
     }
 
+    // Mask를 적용
     _mm512_mask_storeu_ps(C + 0*ldc, mask, c0);
     _mm512_mask_storeu_ps(C + 1*ldc, mask, c1);
     _mm512_mask_storeu_ps(C + 2*ldc, mask, c2);
@@ -300,11 +346,10 @@ inline void kernel_16x16_masked(int k, const float* __restrict__ packedA,
     _mm512_mask_storeu_ps(C + 15*ldc, mask, c15);
 }
 
-
-
-
+// 원본 행렬 A와 B는 메모리에 흩어져 있을 수 있기 때문에 이를 순차적으로 읽을 수 있도록 연속된 메모리 공간에 재배치
 inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, int p_max, float* packed) {
     (void)k;
+    // Gather 명령어를 사용하기 위한 인덱스 벡터 생성
     int indices[16];
     for(int i=0; i<16; ++i) indices[i] = i * lda;
     __m512i vindex = _mm512_loadu_si512(indices);
@@ -348,6 +393,8 @@ inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, in
             packed += 256;
         }
         for (; p < p_max; ++p) {
+            // 행렬 A의 블록을 읽어와서 마이크로 커널이 읽기 좋은 형태로 변환 저장
+            // Gather 명령어를 사용하여 흩어진 데이터를 벡터 레지스터로 모음
             __m512 a = _mm512_i32gather_ps(vindex, &A[i0 * lda + p], 4);
             _mm512_store_ps(packed, a);
             packed += 16;
@@ -362,6 +409,7 @@ inline void pack_A(int k, const float* A, int lda, int i0, int i_max, int p0, in
     }
 }
 
+// 데이터 제배치 적용
 inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, int j_max, int nr, float* packed) {
     (void)k;
     if (nr == 16 && j0 + 16 <= j_max) {
@@ -376,6 +424,7 @@ inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, in
                 if (j0 + j < j_max) {
                     *packed++ = B[p * ldb + (j0 + j)];
                 } else {
+                    // 패딩을 0.0f로 채워서 행렬 크기가 안 맞을 때의 안전성 확보
                     *packed++ = 0.0f;
                 }
             }
@@ -383,7 +432,9 @@ inline void pack_B(int k, const float* B, int ldb, int p0, int p_max, int j0, in
     }
 }
 
+// 벡터 내적을 SIMD로 구현
 inline float dot_product(const float* A, const float* B, int k) {
+    // 4개의 누적 레지스터를 사용하여 의존성 병목 완화
     __m512 sum0 = _mm512_setzero_ps();
     __m512 sum1 = _mm512_setzero_ps();
     __m512 sum2 = _mm512_setzero_ps();
@@ -427,6 +478,7 @@ inline void scale_vector(const float* src, float scale, int n, float* dst) {
     }
 }
 
+// 전체 행렬 곱셈을 L1, L2, L3 캐시 크기에 맞는 작은 블록 단위로 쪼개서 수행함
 static constexpr int MR = 16;
 static constexpr int NR = 16;
 static constexpr int MC = 256;
@@ -434,6 +486,7 @@ static constexpr int KC = 256;
 static constexpr int NC = 256;
 
 float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int n) {
+    // 1x1, 1xk 등 특수 케이스에 대한 처리를 먼저 수행함
     if (m == 1 && n == 1) {
         float* C = new float[1];
         C[0] = dot_product(A, B, k);
@@ -446,10 +499,12 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
         return C;
     }
     
+    // 패딩을 고려하여 결과 행렬 크기 계산
     int m_padded = (m + MR - 1) & ~(MR - 1);
     float* C = new float[m_padded * n];
     std::fill(C, C + m_padded * n, 0.0f);
 
+    // 패킹된 데이터를 저장할 버퍼
     static float* packedA = nullptr;
     static float* packedB = nullptr;
     static size_t packedA_size = 0;
@@ -469,10 +524,12 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
         packedB_size = needed_B;
     }
 
+    // 캐시 블로킹을 위한 외부 루프
     for (int p0 = 0; p0 < k; p0 += KC) {
         int p_lim = min(k, p0 + KC);
         
         float* a_pack_ptr = packedA;
+        // A 행렬 패킹
         for (int i0 = 0; i0 < m_padded; i0 += MC) {
             int i_lim = min(m_padded, i0 + MC);
             for (int i = i0; i < i_lim; i += MR) {
@@ -481,6 +538,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
             }
         }
         
+        // B 행렬 패킹 및 연산 수행
         for (int j0 = 0; j0 < n; j0 += NC) {
             int j_lim = min(n, j0 + NC);
 
@@ -492,6 +550,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
             }
 
             const float* p0_a_ptr = packedA;
+            // 실제 연산 수행
             for (int i0 = 0; i0 < m_padded; i0 += MC) {
                 int i_lim = min(m_padded, i0 + MC);
                 
@@ -502,7 +561,7 @@ float* matrix_matrix_multiply(const float* A, int m, int k, const float* B, int 
                 float* current_b_ptr = packedB;
                 for (int j = j0; j < j_lim; j += NR) {
                     int current_nr = min(NR, j_lim - j);
-                    
+                    // 마스킹 필요 여부에 따라 일반 커널 또는 마스킹 커널을 나눔
                     if (current_nr == 16) {
                         for (int i = i0; i < i_lim; i += MR) {
                             kernel_16x16(p_lim - p0, &current_a_block[(i - i0) * (p_lim - p0)], current_b_ptr, &C[i * n + j], n);
@@ -662,9 +721,7 @@ float* pack_matrix_A(int m, int k, const float* A) {
     return packed;
 }
 
-// ==================== Neural Network Layers ====================
-
-
+// 모델 가중치는 변하지 않기 때문에 생성자에서 미리 Transpose 및 Packing을 수행함
 struct Linear {
     int in_dim;
     int out_dim;
@@ -677,15 +734,14 @@ struct Linear {
     Linear(const Linear&) = delete;
     Linear& operator=(const Linear&) = delete;
 
-    Linear(int in_dim, int out_dim, float* weights)
-        : in_dim(in_dim), out_dim(out_dim) {
+    Linear(int in_dim, int out_dim, float* weights): in_dim(in_dim), out_dim(out_dim) {
         W = new float[in_dim * out_dim];
         size_t size = (size_t)in_dim * out_dim;
         for (size_t i = 0; i < size; ++i) W[i] = weights[i];
 
         WT = new float[in_dim * out_dim];
         transpose(W, out_dim, in_dim, WT);
-        
+        // 가중치 행렬을 미리 GEMM 커널에 최적화된 형태로 패킹해둠
         packedW = pack_matrix_A(out_dim, in_dim, W);
         gemv_output = new float[out_dim];
         
@@ -892,7 +948,8 @@ struct FeedForward {
     float* forward(const float* x, int batch_size) {
         float* h = fc1.forward(x, batch_size);
         
-        // Fused ReLU - modify in place
+        // 별도의 함수 호출 없이 메모리 버퍼에서 직접 SIMD로 Max(0, x) 수행
+        // 이를 통해 메모리 대역폭을 절약함
         int size = batch_size * fc1.out_dim;
         __m512 zero = _mm512_setzero_ps();
         int i = 0;
@@ -910,6 +967,7 @@ struct FeedForward {
     }
 };
 
+// 기존에는 매 토큰 생성 시마다 전체 문장의 Attention을 처음부터 다시 계산했지만 이전 토큰들의 Key, Value 상태를 저장해두고, 새로 들어온 토큰만 계산함.
 struct SelfAttention {
     int d_model;
     Linear q_proj;
@@ -917,6 +975,7 @@ struct SelfAttention {
     Linear v_proj;
     Linear o_proj;
     
+    // 캐시 메모리 포인터
     mutable float* k_cache;
     mutable float* v_cache;
     mutable int cache_len;
@@ -979,12 +1038,14 @@ struct SelfAttention {
         }
     }
 
+    // 입력된 프롬프트 전체에 대해 병렬로 Attention 계산 및 캐시 저장
     float* forward_prefill(const float* x, int T) {
         float* Q = q_proj.forward(x, T);
         float* K = k_proj.forward(x, T);
         float* V = v_proj.forward(x, T);
         
         ensure_cache_capacity(T);
+        // 계산된 K, V를 캐시에 저장함
         for (int i = 0; i < T * d_model; i++) {
             k_cache[i] = K[i];
             v_cache[i] = V[i];
@@ -1017,7 +1078,9 @@ struct SelfAttention {
         return out_proj;
     }
     
+    // 새로 생성된 단 하나의 토큰에 대해서만 연산 수행
     float* forward_incremental(const float* x) {
+        // 현재 토큰의 q, k, v만 계산함
         float* q = q_proj.forward(x, 1);
         float* k = k_proj.forward(x, 1);
         float* v = v_proj.forward(x, 1);
@@ -1027,6 +1090,7 @@ struct SelfAttention {
         
         int i = 0;
         for (; i <= d_model - 16; i += 16) {
+            // 새 k, v를 SIMD Store를 사용하여 고속 복사를 통해 캐시 추가
             _mm512_storeu_ps(k_cache + new_pos * d_model + i, _mm512_loadu_ps(k + i));
             _mm512_storeu_ps(v_cache + new_pos * d_model + i, _mm512_loadu_ps(v + i));
         }
@@ -1041,6 +1105,7 @@ struct SelfAttention {
         
         float* scores = scores_buf;
         
+        // 저장된 과거의 k_cache들과 현재의 q를 내적하여 전체 행렬 곱셈이 아닌 벡터 내적 연산으로 축소됨
         for (int j = 0; j < cache_len; j++) {
             __m512 sum = _mm512_setzero_ps();
             const float* kj = k_cache + j * d_model;
@@ -1126,13 +1191,7 @@ struct TransformerBlock {
     mutable float* out_buf;
     mutable float* final_buf;
 
-    TransformerBlock(int d_model, int n_head, int d_ff, float* Wq_weights, float* Wk_weights,
-                     float* Wv_weights, float* Wo_weights, float* fc1_weights, float* fc2_weights)
-        : attn(d_model, n_head, Wq_weights, Wk_weights, Wv_weights, Wo_weights),
-          ffn(d_model, d_ff, fc1_weights, fc2_weights),
-          ln1(d_model),
-          ln2(d_model),
-          d_model(d_model) {
+    TransformerBlock(int d_model, int n_head, int d_ff, float* Wq_weights, float* Wk_weights, float* Wv_weights, float* Wo_weights, float* fc1_weights, float* fc2_weights): attn(d_model, n_head, Wq_weights, Wk_weights, Wv_weights, Wo_weights), ffn(d_model, d_ff, fc1_weights, fc2_weights), ln1(d_model), ln2(d_model), d_model(d_model) {
         out_buf = new float[d_model];
         final_buf = new float[d_model];
     }
@@ -1257,9 +1316,7 @@ struct GPTMini::Impl {
         blocks.reserve(n_layer);
         for (int i = 0; i < n_layer; i++) {
             const auto& bw = block_weights[i];
-            blocks.emplace_back(std::make_unique<TransformerBlock>(d_model, n_head, d_ff, bw.Wq,
-                                                                   bw.Wk, bw.Wv, bw.Wo, bw.fc1,
-                                                                   bw.fc2));
+            blocks.emplace_back(std::make_unique<TransformerBlock>(d_model, n_head, d_ff, bw.Wq,bw.Wk, bw.Wv, bw.Wo, bw.fc1, bw.fc2));
         }
     }
 
@@ -1289,7 +1346,7 @@ struct GPTMini::Impl {
             
         float* x = new float[T * d_model];
         for (int t = 0; t < T; t++) {
-                int id = context[t];
+            int id = context[t];
             for (int i = 0; i < d_model; i++) x[t * d_model + i] = embed_W[id * d_model + i];
         }
         for (int layer = 0; layer < n_layer; ++layer) {
